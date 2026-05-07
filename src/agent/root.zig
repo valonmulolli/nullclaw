@@ -14,7 +14,9 @@ const providers = @import("../providers/root.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
 const ChatResponse = providers.ChatResponse;
+const ContentPart = providers.ContentPart;
 const ToolSpec = providers.ToolSpec;
+const redaction = @import("../redaction.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const memory_mod = @import("../memory/root.zig");
@@ -268,6 +270,12 @@ pub const Agent = struct {
     response_cache: ?*cache.ResponseCache = null,
     /// Optional MemoryRuntime pointer for diagnostics (e.g. /doctor command).
     mem_rt: ?*memory_mod.MemoryRuntime = null,
+    /// DG-2: optional per-conversation Redactor for PII scrubbing before
+    /// outbound provider calls. Heap-allocated when `enable_pii_redaction`
+    /// is true on the active agent profile (default true). State (counters,
+    /// maps) lives on `self.allocator`; redacted slices for each turn are
+    /// allocated on the per-turn arena.
+    redactor: ?*redaction.Redactor = null,
     /// Optional session scope for memory read/write operations.
     memory_session_id: ?[]const u8 = null,
     observer: Observer,
@@ -521,6 +529,24 @@ pub const Agent = struct {
             effective_workspace_dir,
         ) catch null;
 
+        // DG-2: per-conversation PII redactor (default-on, can be disabled per agent profile).
+        const redactor_ptr: ?*redaction.Redactor = blk: {
+            const enabled = if (profile) |p| p.enable_pii_redaction else true;
+            if (!enabled) break :blk null;
+            const r = try allocator.create(redaction.Redactor);
+            // Inner errdefer covers any future fallible op between alloc and break.
+            errdefer allocator.destroy(r);
+            r.* = redaction.Redactor.init(allocator, .{});
+            break :blk r;
+        };
+        // Outer errdefer fires if any future fallible op is added between this block
+        // and the return statement. Currently no such op exists, but the cost of
+        // defensive coverage is one branch — see DG-2 review.
+        errdefer if (redactor_ptr) |r| {
+            r.deinit();
+            allocator.destroy(r);
+        };
+
         return .{
             .allocator = allocator,
             .provider = provider_i,
@@ -528,6 +554,7 @@ pub const Agent = struct {
             .tool_specs = specs,
             .mem = mem,
             .bootstrap = bootstrap_provider,
+            .redactor = redactor_ptr,
             .observer = observer_i,
             .model_name = default_model,
             .default_provider = default_provider,
@@ -575,6 +602,10 @@ pub const Agent = struct {
 
     pub fn deinit(self: *Agent) void {
         if (self.bootstrap) |bp| bp.deinit();
+        if (self.redactor) |r| {
+            r.deinit();
+            self.allocator.destroy(r);
+        }
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.profile_system_prompt_owned and self.profile_system_prompt != null) self.allocator.free(self.profile_system_prompt.?);
@@ -794,7 +825,7 @@ pub const Agent = struct {
             .max_history_messages = self.max_history_messages,
             .workspace_dir = self.workspace_dir,
             .bootstrap_provider = self.bootstrap,
-        });
+        }, self.redactor);
     }
 
     /// Force-compress history for context exhaustion recovery.
@@ -2636,13 +2667,23 @@ pub const Agent = struct {
         defer self.allocator.free(summary_messages);
         const summary_max_tokens = self.effectiveMaxTokensForMessages(summary_messages, false);
 
+        // DG-2: also redact the iteration-limit summary call. This is a separate
+        // build path from `buildProviderMessagesForTurn`, so the main hook does
+        // not cover it; without this, max-iterations would leak unredacted PII.
+        var summary_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer summary_arena.deinit();
+        const send_summary_messages: []ChatMessage = if (self.redactor) |r|
+            try redactMessagesForProvider(summary_arena.allocator(), summary_messages, r)
+        else
+            summary_messages;
+
         const summary_timer_start = std_compat.time.milliTimestamp();
-        self.recordLlmRequestEvent(self.model_name, summary_messages);
-        self.logLlmRequest(self.max_tool_iterations + 1, 1, self.model_name, summary_messages, false, false);
+        self.recordLlmRequestEvent(self.model_name, send_summary_messages);
+        self.logLlmRequest(self.max_tool_iterations + 1, 1, self.model_name, send_summary_messages, false, false);
         var summary_response = self.provider.chat(
             self.allocator,
             .{
-                .messages = summary_messages,
+                .messages = send_summary_messages,
                 .session_id = self.memory_session_id,
                 .model = self.model_name,
                 .temperature = self.temperature,
@@ -3381,25 +3422,69 @@ pub const Agent = struct {
         model_name: []const u8,
         priority_tool: ?[]const u8,
     ) ![]ChatMessage {
-        const messages = try self.buildProviderMessages(arena, model_name);
-        const tool_name = priority_tool orelse return messages;
+        const raw: []ChatMessage = blk: {
+            const messages = try self.buildProviderMessages(arena, model_name);
+            const tool_name = priority_tool orelse break :blk messages;
 
-        var i = messages.len;
-        while (i > 0) {
-            i -= 1;
-            if (messages[i].role != .user) continue;
-            if (messages[i].content_parts != null) return messages;
+            var i = messages.len;
+            while (i > 0) {
+                i -= 1;
+                if (messages[i].role != .user) continue;
+                if (messages[i].content_parts != null) break :blk messages;
 
-            const with_hint = try arena.dupe(ChatMessage, messages);
-            with_hint[i].content = try std.fmt.allocPrint(
-                arena,
-                "[PRIORITY: Please call the {s} tool immediately] {s}",
-                .{ tool_name, messages[i].content },
-            );
-            return with_hint;
+                const with_hint = try arena.dupe(ChatMessage, messages);
+                with_hint[i].content = try std.fmt.allocPrint(
+                    arena,
+                    "[PRIORITY: Please call the {s} tool immediately] {s}",
+                    .{ tool_name, messages[i].content },
+                );
+                break :blk with_hint;
+            }
+
+            break :blk messages;
+        };
+
+        // DG-2: optional pre-provider PII redaction. Same Redactor instance is
+        // reused across turns so a given email/card maps to the same placeholder
+        // id throughout the conversation. The redacted slices live on `arena`
+        // (per-turn), while Redactor state stays on `self.allocator`.
+        if (self.redactor) |r| {
+            return try redactMessagesForProvider(arena, raw, r);
         }
+        return raw;
+    }
 
-        return messages;
+    pub fn redactMessagesForProvider(
+        arena: std.mem.Allocator,
+        messages: []const ChatMessage,
+        redactor: *redaction.Redactor,
+    ) ![]ChatMessage {
+        const out = try arena.alloc(ChatMessage, messages.len);
+        for (messages, 0..) |msg, i| {
+            out[i] = msg;
+            if (msg.content.len > 0) {
+                out[i].content = try redactor.redact(arena, msg.content);
+            }
+            if (msg.content_parts) |parts| {
+                out[i].content_parts = try redactContentParts(arena, parts, redactor);
+            }
+        }
+        return out;
+    }
+
+    fn redactContentParts(
+        arena: std.mem.Allocator,
+        parts: []const ContentPart,
+        redactor: *redaction.Redactor,
+    ) ![]ContentPart {
+        const out = try arena.alloc(ContentPart, parts.len);
+        for (parts, 0..) |p, i| {
+            out[i] = switch (p) {
+                .text => |t| ContentPart{ .text = try redactor.redact(arena, t) },
+                .image_url, .image_base64 => p,
+            };
+        }
+        return out;
     }
 
     fn appendMultimodalAllowedDir(
@@ -4408,7 +4493,8 @@ test "Agent.fromConfigWithProfile applies named profile defaults" {
 
 test "turn prepends profile system prompt when profile is active" {
     const CaptureProvider = struct {
-        captured_system: ?[]const u8 = null,
+        captured_system: ?[]u8 = null,
+        capture_alloc: std.mem.Allocator,
 
         fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
             return allocator.dupe(u8, "");
@@ -4417,7 +4503,8 @@ test "turn prepends profile system prompt when profile is active" {
         fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (request.messages.len > 0 and request.messages[0].role == .system) {
-                self.captured_system = request.messages[0].content;
+                if (self.captured_system) |old| self.capture_alloc.free(old);
+                self.captured_system = try self.capture_alloc.dupe(u8, request.messages[0].content);
             }
             return .{
                 .content = try allocator.dupe(u8, "ok"),
@@ -4450,7 +4537,8 @@ test "turn prepends profile system prompt when profile is active" {
         .getName = CaptureProvider.getName,
         .deinit = CaptureProvider.deinitFn,
     };
-    var provider_state = CaptureProvider{};
+    var provider_state = CaptureProvider{ .capture_alloc = allocator };
+    defer if (provider_state.captured_system) |c| allocator.free(c);
     const provider = Provider{
         .ptr = @ptrCast(&provider_state),
         .vtable = &provider_vtable,
@@ -10285,4 +10373,550 @@ test "loop honors max_tool_iterations limit" {
     try std.testing.expectEqual(max_iters + 1, @as(u32, @intCast(provider_state.calls)));
     // Response contains the iteration-limit prefix.
     try std.testing.expect(std.mem.indexOf(u8, response, "[Tool iteration limit:") != null);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DG-2: Pre-provider PII redaction tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+const RedactCaptureProvider = struct {
+    captured_user: ?[]u8 = null,
+    capture_alloc: std.mem.Allocator,
+
+    fn chatWithSystem(_: *anyopaque, alloc: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return alloc.dupe(u8, "");
+    }
+
+    fn chat(ptr: *anyopaque, alloc: std.mem.Allocator, request: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        // Capture the LAST user message content (turn may issue multiple calls; we want the most recent).
+        var i = request.messages.len;
+        while (i > 0) {
+            i -= 1;
+            if (request.messages[i].role == .user) {
+                if (self.captured_user) |old| self.capture_alloc.free(old);
+                self.captured_user = try self.capture_alloc.dupe(u8, request.messages[i].content);
+                break;
+            }
+        }
+        return .{
+            .content = try alloc.dupe(u8, "ok"),
+            .tool_calls = &.{},
+            .usage = .{},
+            .model = try alloc.dupe(u8, model),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "dg2-redact-capture";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+const dg2_capture_vtable = Provider.VTable{
+    .chatWithSystem = RedactCaptureProvider.chatWithSystem,
+    .chat = RedactCaptureProvider.chat,
+    .supportsNativeTools = RedactCaptureProvider.supportsNativeTools,
+    .getName = RedactCaptureProvider.getName,
+    .deinit = RedactCaptureProvider.deinitFn,
+};
+
+fn dg2BaseConfig(allocator: std.mem.Allocator) Config {
+    return Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_provider = "openrouter",
+        .default_model = "openrouter/test-model",
+        .allocator = allocator,
+    };
+}
+
+test "Agent: redactor enabled scrubs email before provider" {
+    const allocator = std.testing.allocator;
+    var state = RedactCaptureProvider{ .capture_alloc = allocator };
+    defer if (state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+
+    var cfg = dg2BaseConfig(allocator);
+    const profile = config_types.NamedAgentConfig{
+        .name = "redact-on",
+        .provider = "openrouter",
+        .model = "openrouter/test-model",
+        .enable_pii_redaction = true,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), profile);
+    defer agent.deinit();
+
+    try std.testing.expect(agent.redactor != null);
+
+    const response = try agent.turn("contact me at user@example.com please");
+    defer allocator.free(response);
+
+    try std.testing.expect(state.captured_user != null);
+    const got = state.captured_user.?;
+    // Regression: email in user message must be replaced with a numbered placeholder.
+    try std.testing.expect(std.mem.indexOf(u8, got, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "user@example.com") == null);
+}
+
+test "Agent: redactor disabled passes content through verbatim" {
+    const allocator = std.testing.allocator;
+    var state = RedactCaptureProvider{ .capture_alloc = allocator };
+    defer if (state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+
+    var cfg = dg2BaseConfig(allocator);
+    const profile = config_types.NamedAgentConfig{
+        .name = "redact-off",
+        .provider = "openrouter",
+        .model = "openrouter/test-model",
+        .enable_pii_redaction = false,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), profile);
+    defer agent.deinit();
+
+    try std.testing.expect(agent.redactor == null);
+
+    const response = try agent.turn("contact me at user@example.com please");
+    defer allocator.free(response);
+
+    try std.testing.expect(state.captured_user != null);
+    const got = state.captured_user.?;
+    // When disabled, original content must reach the provider untouched.
+    try std.testing.expect(std.mem.indexOf(u8, got, "user@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "[EMAIL_1]") == null);
+}
+
+test "Agent: redactor preserves cross-turn placeholder ids" {
+    const allocator = std.testing.allocator;
+    var state = RedactCaptureProvider{ .capture_alloc = allocator };
+    defer if (state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+
+    var cfg = dg2BaseConfig(allocator);
+    const profile = config_types.NamedAgentConfig{
+        .name = "redact-cross-turn",
+        .provider = "openrouter",
+        .model = "openrouter/test-model",
+        .enable_pii_redaction = true,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), profile);
+    defer agent.deinit();
+
+    // Turn 1: introduce a@b.co — should become EMAIL_1.
+    const r1 = try agent.turn("first ping a@b.co");
+    defer allocator.free(r1);
+    try std.testing.expect(state.captured_user != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.captured_user.?, "[EMAIL_1]") != null);
+
+    // Turn 2: same email — must reuse EMAIL_1, not bump to EMAIL_2.
+    const r2 = try agent.turn("follow-up to a@b.co");
+    defer allocator.free(r2);
+    try std.testing.expect(state.captured_user != null);
+    const got2 = state.captured_user.?;
+    try std.testing.expect(std.mem.indexOf(u8, got2, "[EMAIL_1]") != null);
+    // Regression: counter must NOT have advanced to EMAIL_2 for the same email.
+    try std.testing.expect(std.mem.indexOf(u8, got2, "[EMAIL_2]") == null);
+}
+
+test "Agent.redactMessagesForProvider preserves multimodal image parts" {
+    // Direct unit test on the helper: text content_parts get redacted, image parts pass through.
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var redactor = redaction.Redactor.init(allocator, .{});
+    defer redactor.deinit();
+
+    const parts = [_]ContentPart{
+        ContentPart{ .text = "see a@b.co for context" },
+        ContentPart{ .image_url = .{ .url = "https://example.com/x.png" } },
+    };
+    const messages = [_]ChatMessage{
+        ChatMessage{
+            .role = .user,
+            .content = "",
+            .content_parts = &parts,
+        },
+    };
+
+    const out = try Agent.redactMessagesForProvider(arena.allocator(), &messages, &redactor);
+
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expect(out[0].content_parts != null);
+    const out_parts = out[0].content_parts.?;
+    try std.testing.expectEqual(@as(usize, 2), out_parts.len);
+
+    // Text part redacted.
+    try std.testing.expect(std.meta.activeTag(out_parts[0]) == .text);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[0].text, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[0].text, "a@b.co") == null);
+
+    // Image part preserved verbatim (URL and detail untouched).
+    try std.testing.expect(std.meta.activeTag(out_parts[1]) == .image_url);
+    try std.testing.expectEqualStrings("https://example.com/x.png", out_parts[1].image_url.url);
+}
+
+// ---- DG-2 Test 6: iteration-exhausted summary path ----
+
+test "Agent: redactor scrubs PII in iteration-exhausted summary call" {
+    // Regression: round-1 review fixed a leak where the summary call (when
+    // agent hits max_tool_iterations) bypassed the redaction hook. This test
+    // forces the loop to exhaust and asserts the summary call sees redacted PII.
+
+    const NoopIterTool = struct {
+        const Self = @This();
+        pub const tool_name = "noop_iter_dg2";
+        pub const tool_description = "noop for DG-2 iteration cap test";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{ .success = true, .output = try allocator.dupe(u8, "noop ok") };
+        }
+    };
+
+    const LoopingRedactCapture = struct {
+        const Self = @This();
+        calls: usize = 0,
+        cap: usize,
+        last_user: ?[]u8 = null,
+        capture_alloc: std.mem.Allocator,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // Capture the FIRST user message — that's the original turn input
+            // (the one that contained the email). On the post-cap summary call,
+            // the agent appends a pseudo-user "SYSTEM: max iterations…" message
+            // that DOES NOT contain PII, so capturing the *last* user would
+            // silently miss the actual regression we're guarding.
+            for (request.messages) |msg| {
+                if (msg.role == .user) {
+                    if (self.last_user) |old| self.capture_alloc.free(old);
+                    self.last_user = try self.capture_alloc.dupe(u8, msg.content);
+                    break;
+                }
+            }
+            // Within cap: keep loop alive with a tool call. After cap: plain text.
+            if (self.calls <= self.cap) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-noop-iter-dg2"),
+                    .name = try allocator.dupe(u8, "noop_iter_dg2"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "calling tool"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+            return .{
+                .content = try allocator.dupe(u8, "post-cap summary"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "looping-redact-capture";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    const max_iters: u32 = 1;
+
+    var provider_state = LoopingRedactCapture{ .cap = max_iters, .capture_alloc = allocator };
+    defer if (provider_state.last_user) |c| allocator.free(c);
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = LoopingRedactCapture.chatWithSystem,
+        .chat = LoopingRedactCapture.chat,
+        .supportsNativeTools = LoopingRedactCapture.supportsNativeTools,
+        .getName = LoopingRedactCapture.getName,
+        .deinit = LoopingRedactCapture.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop_tool = NoopIterTool{};
+    const tool_list = [_]Tool{noop_tool.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+    // `fromConfigWithProfile` doesn't take tools; we'll wire them on the agent struct.
+    var cfg = dg2BaseConfig(allocator);
+    const profile = config_types.NamedAgentConfig{
+        .name = "iter-exhausted",
+        .provider = "openrouter",
+        .model = "openrouter/test-model",
+        .enable_pii_redaction = true,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, tool_list[0..], null, noop.observer(), profile);
+    defer agent.deinit();
+    // Override default tool_specs with our build (deinit will free this).
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = specs;
+    agent.max_tool_iterations = max_iters;
+
+    try std.testing.expect(agent.redactor != null);
+
+    const response = try agent.turn("contact me at user@example.com please");
+    defer allocator.free(response);
+
+    // Iteration exhausted path produces a response prefixed with "[Tool iteration limit:"
+    // ONLY when summary_response itself fails. On happy path (provider returns plain text
+    // post-cap), agent uses the summary response as its response. Either way, the
+    // critical invariant is that the captured user message in the post-cap call
+    // had the email already redacted.
+    try std.testing.expect(provider_state.calls >= max_iters + 1);
+    try std.testing.expect(provider_state.last_user != null);
+    const captured = provider_state.last_user.?;
+    // Regression guard: raw email must never reach the summarizer prompt.
+    try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
+}
+
+// ---- DG-2 Test 7: streaming path ----
+
+test "Agent: redactor scrubs PII before provider.streamChat" {
+    // Regression: streamChat path must apply the same hook as chat. The hook
+    // lives inside buildProviderMessagesForTurn so it covers both call sites,
+    // but a future refactor that splits streaming-only message-building would
+    // silently regress. This test guards that path explicitly.
+
+    const StreamRedactCapture = struct {
+        const Self = @This();
+        captured_user: ?[]u8 = null,
+        capture_alloc: std.mem.Allocator,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        // Fallback chat (should not be called in this test).
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "should-not-be-used"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, model),
+            };
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            // Capture the last user message content (post-redaction view).
+            var i = request.messages.len;
+            while (i > 0) {
+                i -= 1;
+                if (request.messages[i].role == .user) {
+                    if (self.captured_user) |old| self.capture_alloc.free(old);
+                    self.captured_user = try self.capture_alloc.dupe(u8, request.messages[i].content);
+                    break;
+                }
+            }
+            // Emit single content chunk + final.
+            callback(callback_ctx, providers.StreamChunk.textDelta("ok"));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .reasoning_content = null,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "stream-test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "streaming-redact-capture";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = StreamRedactCapture{ .capture_alloc = allocator };
+    defer if (provider_state.captured_user) |c| allocator.free(c);
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StreamRedactCapture.chatWithSystem,
+        .chat = StreamRedactCapture.chat,
+        .supportsNativeTools = StreamRedactCapture.supportsNativeTools,
+        .getName = StreamRedactCapture.getName,
+        .deinit = StreamRedactCapture.deinitFn,
+        .stream_chat = StreamRedactCapture.streamChat,
+        .supports_streaming = StreamRedactCapture.supportsStreaming,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var cfg = dg2BaseConfig(allocator);
+    const profile = config_types.NamedAgentConfig{
+        .name = "streaming-redact",
+        .provider = "openrouter",
+        .model = "openrouter/test-model",
+        .enable_pii_redaction = true,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), profile);
+    defer agent.deinit();
+
+    // Activate streaming path: both callback and ctx must be non-null AND provider
+    // must report supportsStreaming() true.
+    const StreamSink = struct {
+        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
+    };
+    var sink_ctx: u8 = 0;
+    agent.stream_callback = StreamSink.onChunk;
+    agent.stream_ctx = @ptrCast(&sink_ctx);
+
+    try std.testing.expect(agent.redactor != null);
+
+    const response = try agent.turn("contact me at user@example.com please");
+    defer allocator.free(response);
+
+    try std.testing.expect(provider_state.captured_user != null);
+    const captured = provider_state.captured_user.?;
+    try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+}
+
+// ---- DG-2 Test 8: system prompt with PII ----
+
+test "Agent: redactor scrubs PII in system prompt" {
+    // Regression: redaction must apply to ALL roles, including system. System
+    // prompts often hardcode example data with PII shapes (e.g. "support
+    // email: support@example.com"); test that they don't leak verbatim.
+
+    const SystemPromptCapture = struct {
+        const Self = @This();
+        captured_system: ?[]u8 = null,
+        capture_alloc: std.mem.Allocator,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            // Capture the FIRST system message (the prompt).
+            for (request.messages) |msg| {
+                if (msg.role == .system) {
+                    if (self.captured_system) |old| self.capture_alloc.free(old);
+                    self.captured_system = try self.capture_alloc.dupe(u8, msg.content);
+                    break;
+                }
+            }
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, model),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "system-prompt-capture";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = SystemPromptCapture{ .capture_alloc = allocator };
+    defer if (provider_state.captured_system) |c| allocator.free(c);
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SystemPromptCapture.chatWithSystem,
+        .chat = SystemPromptCapture.chat,
+        .supportsNativeTools = SystemPromptCapture.supportsNativeTools,
+        .getName = SystemPromptCapture.getName,
+        .deinit = SystemPromptCapture.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var cfg = dg2BaseConfig(allocator);
+    const profile = config_types.NamedAgentConfig{
+        .name = "system-pii",
+        .provider = "openrouter",
+        .model = "openrouter/test-model",
+        .system_prompt = "Help the user with email user@example.com please",
+        .enable_pii_redaction = true,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), profile);
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expect(provider_state.captured_system != null);
+    const captured = provider_state.captured_system.?;
+    // System prompt content must reach provider with email redacted.
+    try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
 }

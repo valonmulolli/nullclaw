@@ -60,32 +60,35 @@ pub const Redactor = struct {
         self.token_map.deinit();
     }
 
-    /// Redact PII / sensitive data from `input`. Returns owned slice; caller must free.
-    pub fn redact(self: *Redactor, input: []const u8) ![]u8 {
+    /// Redact PII / sensitive data from `input`. Returns slice owned by `dest_allocator`;
+    /// caller must free with the same allocator. Internal state (maps, counters) lives
+    /// on `self.allocator`, so a single Redactor can serve many short-lived destination
+    /// allocators (e.g. per-turn arenas) while preserving cross-call placeholder ids.
+    pub fn redact(self: *Redactor, dest_allocator: std.mem.Allocator, input: []const u8) ![]u8 {
         var out: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer out.deinit(self.allocator);
+        errdefer out.deinit(dest_allocator);
 
         var i: usize = 0;
         while (i < input.len) {
             // Priority order: tokens > email > card > phone > id.
             if (self.config.redact_tokens) {
                 if (matchKeyValueSecret(input, i)) |kv| {
-                    try out.appendSlice(self.allocator, input[i..kv.value_start]);
+                    try out.appendSlice(dest_allocator, input[i..kv.value_start]);
                     const id = try self.intern(&self.token_map, &self.token_count, input[kv.value_start..kv.value_end]);
-                    try writePlaceholder(&out, self.allocator, "TOKEN", id);
+                    try writePlaceholder(&out, dest_allocator, "TOKEN", id);
                     i = kv.value_end;
                     continue;
                 }
                 if (matchBearerToken(input, i)) |bt| {
-                    try out.appendSlice(self.allocator, input[i .. i + bt.prefix_len]);
+                    try out.appendSlice(dest_allocator, input[i .. i + bt.prefix_len]);
                     const id = try self.intern(&self.token_map, &self.token_count, input[i + bt.prefix_len .. bt.end]);
-                    try writePlaceholder(&out, self.allocator, "TOKEN", id);
+                    try writePlaceholder(&out, dest_allocator, "TOKEN", id);
                     i = bt.end;
                     continue;
                 }
                 if (matchPrefixToken(input, i)) |pt| {
                     const id = try self.intern(&self.token_map, &self.token_count, input[i..pt.end]);
-                    try writePlaceholder(&out, self.allocator, "TOKEN", id);
+                    try writePlaceholder(&out, dest_allocator, "TOKEN", id);
                     i = pt.end;
                     continue;
                 }
@@ -93,7 +96,7 @@ pub const Redactor = struct {
             if (self.config.redact_email) {
                 if (matchEmail(input, i)) |em| {
                     const id = try self.intern(&self.email_map, &self.email_count, input[em.start..em.end]);
-                    try writePlaceholder(&out, self.allocator, "EMAIL", id);
+                    try writePlaceholder(&out, dest_allocator, "EMAIL", id);
                     i = em.end;
                     continue;
                 }
@@ -101,7 +104,7 @@ pub const Redactor = struct {
             if (self.config.redact_card) {
                 if (matchCard(input, i)) |cd| {
                     const id = try self.intern(&self.card_map, &self.card_count, input[cd.start..cd.end]);
-                    try writePlaceholder(&out, self.allocator, "CARD", id);
+                    try writePlaceholder(&out, dest_allocator, "CARD", id);
                     i = cd.end;
                     continue;
                 }
@@ -109,26 +112,26 @@ pub const Redactor = struct {
             if (self.config.redact_phone) {
                 if (matchPhone(input, i)) |ph| {
                     const id = try self.intern(&self.phone_map, &self.phone_count, input[ph.start..ph.end]);
-                    try writePlaceholder(&out, self.allocator, "PHONE", id);
+                    try writePlaceholder(&out, dest_allocator, "PHONE", id);
                     i = ph.end;
                     continue;
                 }
             }
             if (self.config.redact_id) {
                 if (matchAnchoredId(input, i)) |idm| {
-                    try out.appendSlice(self.allocator, input[i..idm.value_start]);
+                    try out.appendSlice(dest_allocator, input[i..idm.value_start]);
                     const id = try self.intern(&self.id_map, &self.id_count, input[idm.value_start..idm.value_end]);
-                    try writePlaceholder(&out, self.allocator, "ID", id);
+                    try writePlaceholder(&out, dest_allocator, "ID", id);
                     i = idm.value_end;
                     continue;
                 }
             }
 
-            try out.append(self.allocator, input[i]);
+            try out.append(dest_allocator, input[i]);
             i += 1;
         }
 
-        return try out.toOwnedSlice(self.allocator);
+        return try out.toOwnedSlice(dest_allocator);
     }
 
     fn intern(self: *Redactor, map: *std.StringHashMap(u32), counter: *u32, value: []const u8) !u32 {
@@ -404,7 +407,7 @@ test "Redactor redacts email to numbered placeholder" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("contact me at user@example.com");
+    const out = try r.redact(allocator, "contact me at user@example.com");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("contact me at [EMAIL_1]", out);
 }
@@ -414,9 +417,9 @@ test "Redactor email deterministic across calls" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const a = try r.redact("a@b.co");
+    const a = try r.redact(allocator, "a@b.co");
     defer allocator.free(a);
-    const b = try r.redact("a@b.co");
+    const b = try r.redact(allocator, "a@b.co");
     defer allocator.free(b);
     try std.testing.expectEqualStrings("[EMAIL_1]", a);
     try std.testing.expectEqualStrings("[EMAIL_1]", b);
@@ -426,7 +429,7 @@ test "Redactor different emails get sequential ids" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("a@b.co and x@y.zz");
+    const out = try r.redact(allocator, "a@b.co and x@y.zz");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("[EMAIL_1] and [EMAIL_2]", out);
 }
@@ -435,7 +438,7 @@ test "Redactor phone E.164 redacted" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("call +12025551234 now");
+    const out = try r.redact(allocator, "call +12025551234 now");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("call [PHONE_1] now", out);
 }
@@ -445,7 +448,7 @@ test "Redactor phone without plus prefix is preserved" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("see issue 12025551234");
+    const out = try r.redact(allocator, "see issue 12025551234");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("see issue 12025551234", out);
 }
@@ -455,7 +458,7 @@ test "Redactor card with valid Luhn redacted" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("paid with 4111 1111 1111 1111");
+    const out = try r.redact(allocator, "paid with 4111 1111 1111 1111");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("paid with [CARD_1]", out);
 }
@@ -465,7 +468,7 @@ test "Redactor card without valid Luhn preserved" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("ref 1234567890123456");
+    const out = try r.redact(allocator, "ref 1234567890123456");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("ref 1234567890123456", out);
 }
@@ -474,7 +477,7 @@ test "Redactor passport anchored ID redacted" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("passport: 4516378901");
+    const out = try r.redact(allocator, "passport: 4516378901");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("passport: [ID_1]", out);
 }
@@ -484,7 +487,7 @@ test "Redactor unanchored digit run preserved" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("see ticket 4516378901 next week");
+    const out = try r.redact(allocator, "see ticket 4516378901 next week");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("see ticket 4516378901 next week", out);
 }
@@ -493,7 +496,7 @@ test "Redactor token prefix sk- redacted" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("got sk-abcdef123");
+    const out = try r.redact(allocator, "got sk-abcdef123");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("got [TOKEN_1]", out);
 }
@@ -502,7 +505,7 @@ test "Redactor key-value secret redacted" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("api_key=mysecret");
+    const out = try r.redact(allocator, "api_key=mysecret");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("api_key=[TOKEN_1]", out);
 }
@@ -511,7 +514,7 @@ test "Redactor Bearer token redacted" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("auth Bearer eyJhbGciOiJ");
+    const out = try r.redact(allocator, "auth Bearer eyJhbGciOiJ");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("auth Bearer [TOKEN_1]", out);
 }
@@ -520,7 +523,7 @@ test "Redactor preserves non-sensitive text verbatim" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("hello world, no secrets here");
+    const out = try r.redact(allocator, "hello world, no secrets here");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("hello world, no secrets here", out);
 }
@@ -530,9 +533,9 @@ test "Redactor idempotent on already-redacted text" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out1 = try r.redact("user a@b.co exists");
+    const out1 = try r.redact(allocator, "user a@b.co exists");
     defer allocator.free(out1);
-    const out2 = try r.redact(out1);
+    const out2 = try r.redact(allocator, out1);
     defer allocator.free(out2);
     try std.testing.expectEqualStrings(out1, out2);
 }
@@ -541,7 +544,7 @@ test "Redactor multi-category in single input" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("user a@b.co paid 4111 1111 1111 1111");
+    const out = try r.redact(allocator, "user a@b.co paid 4111 1111 1111 1111");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("user [EMAIL_1] paid [CARD_1]", out);
 }
@@ -550,7 +553,7 @@ test "Redactor config disables category" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{ .redact_email = false });
     defer r.deinit();
-    const out = try r.redact("contact a@b.co");
+    const out = try r.redact(allocator, "contact a@b.co");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("contact a@b.co", out);
 }
@@ -559,7 +562,7 @@ test "Redactor empty input returns empty output" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
-    const out = try r.redact("");
+    const out = try r.redact(allocator, "");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("", out);
 }

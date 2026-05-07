@@ -12,6 +12,7 @@ const providers = @import("../providers/root.zig");
 const config_types = @import("../config_types.zig");
 const path_prefix = @import("../path_prefix.zig");
 const util = @import("../util.zig");
+const redaction = @import("../redaction.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
 const bootstrap_mod = @import("../bootstrap/root.zig");
@@ -85,6 +86,7 @@ pub fn autoCompactHistory(
     provider: Provider,
     model_name: []const u8,
     config: CompactionConfig,
+    redactor: ?*redaction.Redactor,
 ) !bool {
     const has_system = history.items.len > 0 and history.items[0].role == .system;
     const start: usize = if (has_system) 1 else 0;
@@ -112,11 +114,11 @@ pub fn autoCompactHistory(
         const mid = start + compact_count / 2;
 
         // Summarize first half
-        const summary_a = try summarizeSlice(allocator, provider, model_name, history.items, start, mid, config);
+        const summary_a = try summarizeSlice(allocator, provider, model_name, history.items, start, mid, config, redactor);
         defer allocator.free(summary_a);
 
         // Summarize second half
-        const summary_b = try summarizeSlice(allocator, provider, model_name, history.items, mid, compact_end, config);
+        const summary_b = try summarizeSlice(allocator, provider, model_name, history.items, mid, compact_end, config, redactor);
         defer allocator.free(summary_b);
 
         // Merge the two summaries
@@ -134,7 +136,7 @@ pub fn autoCompactHistory(
         }
 
         break :blk merged;
-    } else try summarizeSlice(allocator, provider, model_name, history.items, start, compact_end, config);
+    } else try summarizeSlice(allocator, provider, model_name, history.items, start, compact_end, config, redactor);
     defer allocator.free(summary);
 
     const workspace_context = try readWorkspaceContextForSummary(allocator, config.workspace_dir, config.bootstrap_provider);
@@ -305,6 +307,7 @@ fn summarizeSlice(
     start: usize,
     end: usize,
     config: CompactionConfig,
+    redactor: ?*redaction.Redactor,
 ) ![]u8 {
     const transcript = try buildCompactionTranscript(allocator, history_items, start, end, config.max_source_chars);
     defer allocator.free(transcript);
@@ -318,7 +321,16 @@ fn summarizeSlice(
         .{ .role = .user, .content = summarizer_user },
     };
 
-    const messages_slice = summary_messages[0..2];
+    // DG-2: redact PII from compaction summary before sending. The user message
+    // here embeds the full transcript, so this path is the most likely to leak
+    // raw PII into the upstream LLM. Allocations live on `summary_arena` and
+    // are freed at function exit.
+    var summary_arena = std.heap.ArenaAllocator.init(allocator);
+    defer summary_arena.deinit();
+    const messages_slice: []ChatMessage = if (redactor) |r|
+        try Agent.redactMessagesForProvider(summary_arena.allocator(), summary_messages[0..2], r)
+    else
+        summary_messages[0..2];
 
     const summary_resp = provider.chat(
         allocator,
@@ -652,7 +664,7 @@ test "autoCompactHistory no-op below count and token thresholds" {
 
     const compacted = try autoCompactHistory(allocator, &agent.history, agent.provider, agent.model_name, .{
         .token_limit = DEFAULT_TOKEN_LIMIT,
-    });
+    }, null);
     try std.testing.expect(!compacted);
     try std.testing.expectEqual(@as(usize, 2), agent.history.items.len);
 }
@@ -739,7 +751,7 @@ test "autoCompactHistory does not orphan leading tool result" {
         .keep_recent = 4,
         .max_history_messages = 4,
         .workspace_dir = null,
-    });
+    }, null);
 
     try std.testing.expect(compacted);
     try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
@@ -1055,4 +1067,98 @@ test "buildCompactionTranscript keeps UTF-8 valid when truncating long message c
 
     try std.testing.expect(std.unicode.utf8ValidateSlice(transcript));
     try std.testing.expect(std.mem.indexOf(u8, transcript, "tail") == null);
+}
+
+// DG-2: Compaction-level redaction coverage. Round-2 review found that
+// `summarizeSlice` was a third `provider.chat` site bypassing the main hook;
+// the fix wires `redactor` through. This test guards against accidental
+// regression — drop the redactor arg and the assert fires.
+test "autoCompactHistory redacts PII before sending to summarizer" {
+    const SummaryCaptureProvider = struct {
+        const Self = @This();
+        captured_user: ?[]u8 = null,
+        capture_alloc: std.mem.Allocator,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            // Compaction summarizer call is system + user; capture the user
+            // message — it embeds the transcript that may contain PII.
+            for (request.messages) |msg| {
+                if (msg.role == .user) {
+                    if (self.captured_user) |old| self.capture_alloc.free(old);
+                    self.captured_user = try self.capture_alloc.dupe(u8, msg.content);
+                }
+            }
+            return .{
+                .content = try allocator.dupe(u8, "auto summary"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "compaction-redact-capture";
+        }
+
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SummaryCaptureProvider.chatWithSystem,
+        .chat = SummaryCaptureProvider.chat,
+        .supportsNativeTools = SummaryCaptureProvider.supportsNativeTools,
+        .getName = SummaryCaptureProvider.getName,
+        .deinit = SummaryCaptureProvider.deinit,
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = SummaryCaptureProvider{ .capture_alloc = allocator };
+    defer if (provider_state.captured_user) |c| allocator.free(c);
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var redactor = redaction.Redactor.init(allocator, .{});
+    defer redactor.deinit();
+
+    var agent = try makeTestAgent(allocator);
+    agent.provider = provider;
+    defer agent.deinit();
+
+    // History needs to exceed `max_history_messages = 4` to trigger compaction.
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    // PII-bearing message in the OLD part (will be summarized).
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "contact me at user@example.com please"),
+    });
+    for (0..6) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "filler-{d}", .{i}),
+        });
+    }
+
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .keep_recent = 2,
+        .max_history_messages = 4,
+        .workspace_dir = null,
+    }, &redactor);
+
+    try std.testing.expect(compacted);
+    try std.testing.expect(provider_state.captured_user != null);
+    const captured = provider_state.captured_user.?;
+    // Regression guard: raw email must not have reached the summarizer prompt.
+    try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
 }

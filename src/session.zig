@@ -2430,7 +2430,11 @@ const LateInjectionProvider = struct {
 
 const CapturePromptProvider = struct {
     response: []const u8 = "ok",
-    captured_system: ?[]const u8 = null,
+    captured_system: ?[]u8 = null,
+    /// Allocator used to dup `captured_system` so the test can read it after
+    /// `agent.turn()` returns and the per-turn arena (where request.messages
+    /// live) has been freed. Set by the test before calling `provider()`.
+    capture_alloc: ?Allocator = null,
 
     const vtable = Provider.VTable{
         .chatWithSystem = chatWithSystem,
@@ -2464,7 +2468,10 @@ const CapturePromptProvider = struct {
     ) anyerror!providers.ChatResponse {
         const self: *CapturePromptProvider = @ptrCast(@alignCast(ptr));
         if (request.messages.len > 0 and request.messages[0].role == .system) {
-            self.captured_system = request.messages[0].content;
+            if (self.capture_alloc) |alloc| {
+                if (self.captured_system) |old| alloc.free(old);
+                self.captured_system = try alloc.dupe(u8, request.messages[0].content);
+            }
         }
         return .{ .content = try allocator.dupe(u8, self.response) };
     }
@@ -3241,7 +3248,8 @@ test "getOrCreate preserves named agent system prompt when workspace_path is set
     try testing.expectEqualStrings(expected_prompt, session.agent.profile_system_prompt.?);
     try expectPathEndsWith(session.agent.workspace_dir, "/agents/coder-agent");
 
-    var capture = CapturePromptProvider{};
+    var capture = CapturePromptProvider{ .capture_alloc = testing.allocator };
+    defer if (capture.captured_system) |c| testing.allocator.free(c);
     session.agent.provider = capture.provider();
 
     const response = try session.agent.turn("hello");

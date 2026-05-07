@@ -27,3 +27,6 @@ nullclaw-codebase*.md
 .cursor/
 .trae/
 .codebuddy/
+
+# Claude Code per-user permissions (must not be committed)
+.claude/settings.local.json
