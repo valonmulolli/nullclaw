@@ -59,14 +59,24 @@ pub const SqliteQueryTool = struct {
         };
         const max_rows: u32 = blk: {
             if (root.getInt(args, "max_rows")) |v| {
-                if (v <= 0) break :blk self.max_result_rows;
+                // Schema declares max_rows >= 1; reject explicit non-positive values
+                // (rather than silently coercing) so the schema and impl agree.
+                if (v <= 0) {
+                    return failOwned(allocator, "max_rows must be >= 1");
+                }
                 const clamped = @min(v, @as(i64, @intCast(self.max_result_rows)));
                 break :blk @intCast(clamped);
             }
             break :blk self.max_result_rows;
         };
 
-        // Layer 1a: path safety (rejects absolute, traversal, null bytes)
+        // Layer 1a: path safety (rejects absolute, traversal, null bytes).
+        //
+        // Note: DG-3 is intentionally stricter than file_read — db_path must
+        // be workspace-relative; absolute paths are never accepted even if a
+        // matching prefix is listed in allowed_paths. The intent is to keep
+        // analytics-time access narrow; if you need to read a DB outside the
+        // workspace, mount/symlink it under the workspace explicitly.
         if (!path_security.isPathSafe(db_path_arg)) {
             return failOwned(allocator, "db_path failed safety check (must be relative, no traversal, no null bytes)");
         }
@@ -162,7 +172,15 @@ fn classifyStatement(query: []const u8) ?[]const u8 {
         const after_pragma = std.mem.trimStart(u8, trimmed[first.len..], " \t\r\n");
         const second = firstKeyword(after_pragma) orelse return "only PRAGMA table_info is allowed";
         if (!eqIgnoreCase(second, "table_info")) return "only PRAGMA table_info is allowed";
-        return null;
+        // After "table_info" only `(` (function-call form) or end-of-statement
+        // (followed by optional comments/whitespace) is permitted. This rejects
+        // hypothetical forwards-compatibility names like `table_info_ext` and
+        // similar look-alikes.
+        const after_kw = std.mem.trimStart(u8, after_pragma[second.len..], " \t\r\n");
+        if (after_kw.len == 0) return null;
+        if (after_kw[0] == '(') return null;
+        if (after_kw[0] == ';') return null;
+        return "only PRAGMA table_info is allowed";
     }
     return "only SELECT, WITH, or PRAGMA table_info statements are allowed";
 }
@@ -252,6 +270,12 @@ fn renderRows(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, max_rows: u32
             break;
         }
 
+        // Track length BEFORE the row's leading comma so a single fat row
+        // (e.g. one wide TEXT/BLOB cell) can be rolled back if it pushes
+        // total output past max_bytes. Without this, max_bytes would be a
+        // per-row check only, and one giant cell could blow the cap by
+        // arbitrary margin.
+        const row_start_len = out.items.len;
         if (row_count > 0) try out.append(allocator, ',');
         try out.append(allocator, '[');
         var col: c_int = 0;
@@ -260,6 +284,12 @@ fn renderRows(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, max_rows: u32
             try appendCellAsJson(allocator, &out, stmt, col);
         }
         try out.append(allocator, ']');
+        if (out.items.len > max_bytes) {
+            // Roll back this row entirely (including its leading comma).
+            out.items.len = row_start_len;
+            truncated = true;
+            break;
+        }
         row_count += 1;
     }
 
@@ -396,25 +426,6 @@ const TestDb = struct {
         }
     }
 };
-
-fn setupToolWithDb(comptime db_name: []const u8) !struct {
-    tool: SqliteQueryTool,
-    tmp: std.testing.TmpDir,
-    ws_path: []const u8,
-    db_path: [:0]const u8,
-} {
-    var tmp = std.testing.tmpDir(.{});
-    errdefer tmp.cleanup();
-    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
-    errdefer std.testing.allocator.free(ws_path);
-    const db_path_buf = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/{s}", .{ ws_path, db_name }, 0);
-    return .{
-        .tool = .{ .workspace_dir = ws_path },
-        .tmp = tmp,
-        .ws_path = ws_path,
-        .db_path = db_path_buf,
-    };
-}
 
 test "sqlite_query: SELECT returns columns and rows as JSON" {
     var tmp = std.testing.tmpDir(.{});
@@ -704,4 +715,120 @@ test "classifyStatement: rejects keyword-prefixed garbage" {
     try std.testing.expect(classifyStatement("VACUUM") != null);
     try std.testing.expect(classifyStatement("CREATE TABLE x(a INT)") != null);
     try std.testing.expect(classifyStatement("BEGIN TRANSACTION") != null);
+}
+
+test "classifyStatement: rejects PRAGMA look-alikes" {
+    // Forward-compatibility paranoia: only the exact `table_info` pragma is
+    // allowed. Look-alike names (different keyword OR table_info with extra
+    // alphanumeric trailing chars) must be rejected.
+    try std.testing.expect(classifyStatement("PRAGMA foreign_keys = ON") != null);
+    try std.testing.expect(classifyStatement("PRAGMA table_infox") != null); // longer keyword
+    try std.testing.expect(classifyStatement("PRAGMA writable_schema = 1") != null);
+    // `PRAGMA table_info` standalone (no parens) is OK — sqlite still parses
+    // it as the table_info pragma form (returns empty result without arg).
+    try std.testing.expect(classifyStatement("PRAGMA table_info") == null);
+    try std.testing.expect(classifyStatement("PRAGMA table_info(u)") == null);
+    try std.testing.expect(classifyStatement("PRAGMA table_info ( u )") == null);
+}
+
+test "sqlite_query: max_rows <= 0 explicitly rejected" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs(
+        \\{"db_path":"test.db","query":"SELECT 1","max_rows":0}
+    );
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "max_rows must be >= 1") != null);
+}
+
+test "sqlite_query: max_bytes cap rolls back oversized row" {
+    // Single fat TEXT cell larger than max_result_bytes — must be rolled back
+    // and reported as truncated, not blow the cap.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/wide.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+
+    {
+        var db: ?*c.sqlite3 = null;
+        _ = c.sqlite3_open(db_path_z.ptr, &db);
+        defer _ = c.sqlite3_close(db);
+        _ = c.sqlite3_exec(db, "CREATE TABLE w (payload TEXT);", null, null, null);
+        // Build one ~10 KB row of 'A' chars + one short row.
+        const big = try std.testing.allocator.alloc(u8, 10_000);
+        defer std.testing.allocator.free(big);
+        @memset(big, 'A');
+        var sql_buf: [10_200]u8 = undefined;
+        const sql = try std.fmt.bufPrintZ(&sql_buf, "INSERT INTO w VALUES ('{s}');", .{big});
+        _ = c.sqlite3_exec(db, sql.ptr, null, null, null);
+        _ = c.sqlite3_exec(db, "INSERT INTO w VALUES ('short');", null, null, null);
+    }
+
+    // Tool with tiny byte cap (1 KB). The 10 KB row must be rolled back.
+    var sqt = SqliteQueryTool{
+        .workspace_dir = ws_path,
+        .max_result_bytes = 1024,
+    };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"wide.db\",\"query\":\"SELECT payload FROM w\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    // First (10 KB) row rolled back → no rows surfaced; truncated=true.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"truncated\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"row_count\":0") != null);
+    // Output stays well under twice the cap (some JSON skeleton overhead is fine).
+    try std.testing.expect(result.output.len < 2048);
+}
+
+test "sqlite_query: symlink escape (db_path → outside workspace) rejected" {
+    // Defense via realpath + isResolvedPathAllowed: a workspace-relative
+    // symlink that points outside the workspace must not let the agent read
+    // arbitrary files. If a future refactor drops the realpath step, this
+    // test fires.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    // Create a real DB outside the workspace so realpath actually resolves.
+    var outside_tmp = std.testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+    const outside_path = try @import("compat").fs.Dir.wrap(outside_tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(outside_path);
+    const outside_db = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/secret.db", .{outside_path}, 0);
+    defer std.testing.allocator.free(outside_db);
+    try TestDb.populate(outside_db.ptr);
+
+    // Symlink workspace/escape.db → outside/secret.db (using compat Dir API)
+    @import("compat").fs.Dir.wrap(tmp.dir).symLink(outside_db, "escape.db", .{}) catch |err| {
+        // If symlink creation fails (e.g. unsupported FS), skip the test.
+        std.log.warn("symlink unsupported on this filesystem: {s}", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"escape.db\",\"query\":\"SELECT 1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "outside workspace") != null);
 }
