@@ -10,9 +10,10 @@ services:
   init-data:
     image: alpine:3.23
     profiles: ["agent", "gateway"]
-    command: ["sh", "-lc", "chown -R 65534:65534 /nullclaw-data"]
+    command: ["sh", "-lc", "mkdir -p /nullclaw-data/workspace && chown -R 65534:65534 /nullclaw-data"]
     volumes:
       - nullclaw-data:/nullclaw-data
+      - ./workspace:/nullclaw-data/workspace
     restart: "no"
 
   agent:
@@ -30,6 +31,7 @@ services:
         required: false
     volumes:
       - nullclaw-data:/nullclaw-data
+      - ./workspace:/nullclaw-data/workspace
     restart: unless-stopped
 
   gateway:
@@ -47,6 +49,7 @@ services:
         required: false
     volumes:
       - nullclaw-data:/nullclaw-data
+      - ./workspace:/nullclaw-data/workspace
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${NULLCLAW_PORT:-3210}/health"]

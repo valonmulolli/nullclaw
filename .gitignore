@@ -15,6 +15,7 @@ zig-pkg/
 *.bak
 *.a
 reference/
+workspace/
 
 result
 .direnv/
