@@ -68,6 +68,10 @@ pub const WsClient = struct {
         payload: []u8,
     };
 
+    fn shouldLoadSystemCaBundle() bool {
+        return builtin.target.abi != .android;
+    }
+
     /// Connect to wss://host:port/path.
     /// `extra_headers`: additional HTTP request headers (without trailing CRLF).
     pub fn connect(
@@ -109,12 +113,16 @@ pub const WsClient = struct {
 
         var ca_bundle = std.crypto.Certificate.Bundle.empty;
         var has_ca_bundle = false;
-        if (ca_bundle.rescan(allocator, std_compat.io(), std.Io.Timestamp.now(std_compat.io(), .real))) |_| {
-            has_ca_bundle = true;
-        } else |err| {
-            // Preserve current behavior on platforms/environments where system CAs
-            // are unavailable, but prefer verified TLS whenever possible.
-            log.warn("WS TLS: system CA bundle unavailable, fallback to no verification: {}", .{err});
+        if (shouldLoadSystemCaBundle()) {
+            if (ca_bundle.rescan(allocator, std_compat.io(), std.Io.Timestamp.now(std_compat.io(), .real))) |_| {
+                has_ca_bundle = true;
+            } else |err| {
+                // Preserve current behavior on platforms/environments where system CAs
+                // are unavailable, but prefer verified TLS whenever possible.
+                log.warn("WS TLS: system CA bundle unavailable, fallback to no verification: {}", .{err});
+            }
+        } else {
+            log.warn("WS TLS: skipping system CA bundle load on Android; using no verification", .{});
         }
         if (has_ca_bundle) {
             tls_state.ca_bundle = ca_bundle;
@@ -1057,4 +1065,8 @@ test "ws connect returns ConnectFailed when all resolved addresses fail" {
 
     try std.testing.expectError(error.ConnectFailed, WsClient.connectToResolvedAddresses(fakeConnectAlwaysFails, &addresses));
     try std.testing.expectEqual(@as(usize, 2), test_connect_attempts_len);
+}
+
+test "ws CA bundle loading matches target ABI policy" {
+    try std.testing.expectEqual(builtin.target.abi != .android, WsClient.shouldLoadSystemCaBundle());
 }
