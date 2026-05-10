@@ -35,7 +35,7 @@ up: check-buildx
 	$(COMPOSE) --profile $(PROFILE) up -d --build $(SERVICE)
 
 down:
-	$(COMPOSE) down
+	$(COMPOSE) --profile agent --profile gateway down
 
 run:
 	$(COMPOSE) --profile agent run --rm agent $(RUN_ARGS)
