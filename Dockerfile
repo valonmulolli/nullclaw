@@ -109,7 +109,6 @@ ENV SHELL=/bin/sh
 ENV NULLCLAW_GATEWAY_PORT=3000
 
 WORKDIR /nullclaw-data
-EXPOSE 3000
 ENTRYPOINT ["nullclaw"]
 CMD ["gateway", "--port", "3000", "--host", "::"]
 
