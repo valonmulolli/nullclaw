@@ -57,14 +57,13 @@ pub const TlsState = struct {
 
 /// WebSocket client over TLS.
 /// `write_mu` serializes concurrent frame-level writes (heartbeat + gateway threads).
-/// `io_mu` serializes all TLS transport I/O (readExact/writeTransport/flushTransport)
-/// to prevent concurrent TLS state mutation between the read and heartbeat threads.
+/// Reads are single-threaded (main gateway loop); TLS 1.3 read/write directions are
+/// cryptographically independent, so no mutex is needed for readExact.
 pub const WsClient = struct {
     allocator: std.mem.Allocator,
     stream: std_compat.net.Stream,
     tls: ?*TlsState,
     write_mu: std_compat.sync.Mutex,
-    io_mu: std_compat.sync.Mutex,
 
     pub const Message = struct {
         opcode: Opcode,
@@ -158,7 +157,6 @@ pub const WsClient = struct {
             .stream = stream,
             .tls = tls_state,
             .write_mu = .{},
-            .io_mu = .{},
         };
         errdefer client.deinit();
 
@@ -184,7 +182,6 @@ pub const WsClient = struct {
             .stream = stream,
             .tls = null,
             .write_mu = .{},
-            .io_mu = .{},
         };
         errdefer client.deinit();
 
@@ -290,8 +287,6 @@ pub const WsClient = struct {
         var total: usize = 0;
         while (total < buf.len) {
             const n = if (self.tls) |tls| blk: {
-                self.io_mu.lock();
-                defer self.io_mu.unlock();
                 var rd: [1][]u8 = .{buf[total..]};
                 break :blk tls.tls_client.reader.readVec(&rd) catch |err| switch (err) {
                     error.EndOfStream => return error.ConnectionClosed,
@@ -308,8 +303,6 @@ pub const WsClient = struct {
 
     fn writeTransport(self: *WsClient, bytes: []const u8) !void {
         if (self.tls) |tls| {
-            self.io_mu.lock();
-            defer self.io_mu.unlock();
             try tls.tls_client.writer.writeAll(bytes);
             return;
         }
@@ -318,8 +311,6 @@ pub const WsClient = struct {
 
     fn flushTransport(self: *WsClient) !void {
         if (self.tls) |tls| {
-            self.io_mu.lock();
-            defer self.io_mu.unlock();
             try tls.tls_client.writer.flush();
             try tls.stream_writer.interface.flush();
         }
@@ -744,7 +735,6 @@ test "ws connectPlain compiles with nullable tls transport" {
         .stream = undefined,
         .tls = null,
         .write_mu = .{},
-        .io_mu = .{},
     };
     try std.testing.expect(client.tls == null);
 }
@@ -1018,7 +1008,6 @@ test "ws readMessage aggregates fragmented text and binary frames" {
         .stream = .{ .handle = sockets[0] },
         .tls = null,
         .write_mu = .{},
-        .io_mu = .{},
     };
     defer client.deinit();
 
@@ -1047,7 +1036,6 @@ test "ws readFrame auto-pongs ping and returns null on close frame" {
         .stream = .{ .handle = sockets[0] },
         .tls = null,
         .write_mu = .{},
-        .io_mu = .{},
     };
     defer client.deinit();
 
@@ -1110,7 +1098,6 @@ test "ws readExact TLS tolerates transient zero readVec return" {
         .stream = undefined,
         .tls = &tls_state,
         .write_mu = .{},
-        .io_mu = .{},
     };
 
     var buf: [1]u8 = undefined;
@@ -1128,7 +1115,6 @@ test "ws readExact plain returns ConnectionClosed on immediate EOF" {
         .stream = .{ .handle = fds[0] },
         .tls = null,
         .write_mu = .{},
-        .io_mu = .{},
     };
     defer std.Io.Threaded.closeFd(fds[0]);
 
@@ -1151,7 +1137,6 @@ test "ws readExact plain reads data then ConnectionClosed on EOF" {
         .stream = .{ .handle = fds[0] },
         .tls = null,
         .write_mu = .{},
-        .io_mu = .{},
     };
     defer std.Io.Threaded.closeFd(fds[0]);
 
@@ -1234,7 +1219,6 @@ test "readFrame rejects oversized payload claim before allocation" {
         .stream = .{ .handle = sockets[0] },
         .tls = null,
         .write_mu = .{},
-        .io_mu = .{},
     };
     defer client.deinit();
 
@@ -1250,30 +1234,18 @@ test "readFrame rejects oversized payload claim before allocation" {
     try std.testing.expectError(error.FrameTooLarge, client.readFrame());
 }
 
-test "ws TLS transport serializes read and write operations" {
-    // Verifies that io_mu is held during TLS I/O and cannot be re-acquired concurrently.
-    var tls_reader_storage = [_]u8{0};
-    var tls_state: TlsState = undefined;
-    tls_state.tls_client = undefined;
-    tls_state.tls_client.reader = .{
-        .buffer = &tls_reader_storage,
-        .seek = 0,
-        .end = 1,
-        .vtable = &.{
-            .stream = fake_tls_test_stream,
-            .readVec = fake_tls_read_vec_zero_then_byte,
-        },
-    };
-
+test "ws write_mu serializes concurrent frame writes" {
+    // Verifies that write_mu is non-reentrant: once held, tryLock returns false.
+    // This guards the invariant that writeText/writeBinary/writeClose and the
+    // auto-pong path in readFrame all serialize on write_mu.
     var client = WsClient{
         .allocator = std.testing.allocator,
         .stream = undefined,
-        .tls = &tls_state,
+        .tls = null,
         .write_mu = .{},
-        .io_mu = .{},
     };
 
-    client.io_mu.lock();
-    defer client.io_mu.unlock();
-    try std.testing.expect(client.io_mu.tryLock() == false);
+    client.write_mu.lock();
+    defer client.write_mu.unlock();
+    try std.testing.expect(client.write_mu.tryLock() == false);
 }
