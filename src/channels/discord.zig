@@ -63,6 +63,7 @@ pub const DiscordChannel = struct {
     sequence: Atomic(i64) = Atomic(i64).init(0),
     heartbeat_interval_ms: Atomic(u64) = Atomic(u64).init(0),
     heartbeat_stop: Atomic(bool) = Atomic(bool).init(false),
+    last_gateway_activity_ms: Atomic(i64) = Atomic(i64).init(0),
     session_id: ?[]u8 = null,
     resume_gateway_url: ?[]u8 = null,
     bot_user_id: ?[]u8 = null,
@@ -79,6 +80,9 @@ pub const DiscordChannel = struct {
     pub const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
     const TYPING_INTERVAL_NS: u64 = 8 * std.time.ns_per_s;
     const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
+    /// Minimum stale-gateway grace window. The channel_manager checks health every 10s;
+    /// allow at least 3 heartbeat intervals OR 90s before declaring the gateway dead.
+    const GATEWAY_STALE_GRACE_MS: i64 = 90 * std.time.ms_per_s;
     const InvalidSessionAction = enum {
         identify,
         resume_session,
@@ -157,12 +161,35 @@ pub const DiscordChannel = struct {
         return token[0..dot_pos];
     }
 
-    pub fn healthCheck(_: *DiscordChannel) bool {
-        return true;
+    pub fn healthCheck(self: *DiscordChannel) bool {
+        return self.gatewayHealthyAt(std_compat.time.milliTimestamp());
     }
 
     pub fn setBus(self: *DiscordChannel, b: *bus_mod.Bus) void {
         self.bus = b;
+    }
+
+    // ── Gateway liveness helpers ──────────────────────────────────────────
+
+    fn markGatewayActivityNow(self: *DiscordChannel) void {
+        self.last_gateway_activity_ms.store(std_compat.time.milliTimestamp(), .release);
+    }
+
+    /// Returns true if the gateway appears healthy at the given wall-clock ms.
+    /// Healthy conditions: not running, interval not yet received, or last activity
+    /// within max(3×heartbeat_interval, GATEWAY_STALE_GRACE_MS).
+    fn gatewayHealthyAt(self: *DiscordChannel, now_ms: i64) bool {
+        if (!self.running.load(.acquire)) return true;
+
+        const interval_ms = self.heartbeat_interval_ms.load(.acquire);
+        if (interval_ms == 0) return true;
+
+        const last_activity_ms = self.last_gateway_activity_ms.load(.acquire);
+        if (last_activity_ms == 0 or now_ms <= last_activity_ms) return true;
+
+        const heartbeat_window_ms: i64 = @as(i64, @intCast(interval_ms)) * 3;
+        const stale_after_ms = @max(heartbeat_window_ms, GATEWAY_STALE_GRACE_MS);
+        return (now_ms - last_activity_ms) <= stale_after_ms;
     }
 
     // ── Pure helper functions ─────────────────────────────────────────────
@@ -856,13 +883,23 @@ pub const DiscordChannel = struct {
         const default_host = "gateway.discord.gg";
         const host: []const u8 = if (self.resume_gateway_url) |u| parseGatewayHost(u) else default_host;
 
-        var ws = try websocket.WsClient.connect(
+        var ws = websocket.WsClient.connect(
             self.allocator,
             host,
             443,
             "/?v=10&encoding=json",
             &.{},
-        );
+        ) catch |err| {
+            // Connection failed — clear stale resume URL so the next attempt falls back to
+            // gateway.discord.gg instead of retrying a specific regional node that may be
+            // unreachable (e.g. TemporaryNameServerFailure). session_id is preserved so
+            // RESUME can still be attempted on the canonical host.
+            if (self.resume_gateway_url) |u| {
+                self.allocator.free(u);
+                self.resume_gateway_url = null;
+            }
+            return err;
+        };
 
         // Store fd for interrupt-on-stop
         self.ws_fd.store(ws.stream.handle, .release);
@@ -886,6 +923,8 @@ pub const DiscordChannel = struct {
         const hello_text = try ws.readTextMessage() orelse return error.ConnectionClosed;
         defer self.allocator.free(hello_text);
         try self.handleHello(&ws, hello_text);
+        // Record activity after HELLO so the health watchdog has a baseline timestamp.
+        self.markGatewayActivityNow();
 
         // IDENTIFY or RESUME
         if (self.session_id != null) {
@@ -903,6 +942,7 @@ pub const DiscordChannel = struct {
             };
             const text = maybe_text orelse break;
             defer self.allocator.free(text);
+            self.markGatewayActivityNow();
             self.handleGatewayMessage(&ws, text) catch |err| {
                 if (err == error.ShouldReconnect) return err;
                 log.err("Discord gateway msg error: {}", .{err});
@@ -2051,4 +2091,26 @@ test "DiscordChannel create + healthCheck + stop leaks zero bytes" {
     const ch = ch_struct.channel();
     _ = ch.healthCheck();
     ch.stop();
+}
+
+test "discord health check tolerates expected heartbeat idle window" {
+    var ch = DiscordChannel.init(std.testing.allocator, "token", null, false);
+    ch.running.store(true, .release);
+    ch.heartbeat_interval_ms.store(40_000, .release);
+    ch.last_gateway_activity_ms.store(1_000_000, .release);
+
+    // Within 3× heartbeat window (120s) — must still be healthy.
+    try std.testing.expect(ch.gatewayHealthyAt(1_119_999));
+}
+
+test "discord health check fails after stale gateway idle" {
+    var ch = DiscordChannel.init(std.testing.allocator, "token", null, false);
+    ch.running.store(true, .release);
+    ch.heartbeat_interval_ms.store(40_000, .release);
+    // Regression: a node could stay Discord-online while the gateway socket stopped
+    // delivering events — heartbeat ACKs ceased but the process didn't restart.
+    ch.last_gateway_activity_ms.store(1_000_000, .release);
+
+    // Past 3× heartbeat window (120s) — must be stale.
+    try std.testing.expect(!ch.gatewayHealthyAt(1_120_001));
 }
