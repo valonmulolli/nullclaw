@@ -784,10 +784,16 @@ pub const DiscordChannel = struct {
         self.heartbeat_stop.store(true, .release);
         self.stopAllTyping();
         self.deinitPendingInteractions();
-        // Close socket to unblock blocking read
+        // Shut down the socket to unblock a blocking readv in the gateway thread.
+        // close() on a remote TCP socket does NOT interrupt a blocked readv in another
+        // thread on POSIX/macOS — the kernel holds its own file-description reference
+        // for the blocked reader.  shutdown(SHUT_RDWR) explicitly delivers EOF to the
+        // blocked reader, causing it to return 0 (EndOfStream → ConnectionClosed).
+        // NOTE: No unit test for this path — requires a live remote TCP connection and
+        // concurrent thread; covered by integration testing on vdsmini.
         const fd = self.ws_fd.load(.acquire);
         if (fd != invalid_socket) {
-            (std_compat.net.Stream{ .handle = fd }).close();
+            (std_compat.net.Stream{ .handle = fd }).shutdown(.both) catch {};
         }
         if (self.gateway_thread) |t| {
             t.join();
@@ -902,26 +908,38 @@ pub const DiscordChannel = struct {
         const default_host = "gateway.discord.gg";
         const host: []const u8 = if (self.resume_gateway_url) |u| parseGatewayHost(u) else default_host;
 
-        var ws = websocket.WsClient.connect(
-            self.allocator,
-            host,
-            443,
-            "/?v=10&encoding=json",
-            &.{},
-        ) catch |err| {
-            // Connection failed — clear stale resume URL so the next attempt falls back to
-            // gateway.discord.gg instead of retrying a specific regional node that may be
-            // unreachable (e.g. TemporaryNameServerFailure). session_id is preserved so
-            // RESUME can still be attempted on the canonical host.
+        // Phase 1: DNS + TCP only.
+        // Storing ws_fd before TLS init lets vtableStop interrupt a stalled TLS handshake
+        // via shutdown(.both), which delivers EOF to the blocked readv immediately.
+        const ws_stream = websocket.WsClient.connectTcp(self.allocator, host, 443) catch |err| {
+            // TCP failed — clear stale resume URL so next attempt uses gateway.discord.gg.
             if (self.resume_gateway_url) |u| {
                 self.allocator.free(u);
                 self.resume_gateway_url = null;
             }
             return err;
         };
+        // Store fd now so vtableStop can interrupt even during the TLS handshake below.
+        self.ws_fd.store(ws_stream.handle, .release);
 
-        // Store fd for interrupt-on-stop
-        self.ws_fd.store(ws.stream.handle, .release);
+        // Phase 2: TLS init + WebSocket handshake (interruptible via vtableStop shutdown).
+        var ws = websocket.WsClient.connectFromStream(
+            self.allocator,
+            ws_stream,
+            host,
+            "/?v=10&encoding=json",
+            &.{},
+        ) catch |err| {
+            // connectFromStream closed ws_stream on failure; clear the now-invalid fd.
+            self.ws_fd.store(invalid_socket, .release);
+            // Clear stale resume URL same as TCP failure path above.
+            if (self.resume_gateway_url) |u| {
+                self.allocator.free(u);
+                self.resume_gateway_url = null;
+            }
+            return err;
+        };
+        // ws now owns ws_stream; the defer block below handles ws_fd reset + ws.deinit().
 
         // Start heartbeat thread — on failure, clean up ws manually (no errdefer to avoid
         // double-deinit with the defer block below once spawn succeeds).
