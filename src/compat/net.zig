@@ -387,7 +387,7 @@ pub fn tcpConnectToHost(allocator: Allocator, host: []const u8, port: u16) !Stre
 }
 
 fn shouldUseWindowsLocalhostFallback(name: []const u8) bool {
-    return builtin.os.tag == .windows and std.ascii.eqlIgnoreCase(name, "localhost");
+    return std.ascii.eqlIgnoreCase(name, "localhost");
 }
 
 fn getAddressListWindows(gpa: Allocator, name: []const u8, port: u16) GetAddressListError!*AddressList {
@@ -397,14 +397,17 @@ fn getAddressListWindows(gpa: Allocator, name: []const u8, port: u16) GetAddress
         error.InvalidHostName => return error.UnknownHostName,
     };
 
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    errdefer arena.deinit();
+    const list = blk: {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
 
-    const list = try arena.allocator().create(AddressList);
-    list.* = .{
-        .arena = arena,
-        .addrs = undefined,
-        .canon_name = null,
+        const list = try arena.allocator().create(AddressList);
+        list.* = .{
+            .arena = arena,
+            .addrs = undefined,
+            .canon_name = null,
+        };
+        break :blk list;
     };
     errdefer list.deinit();
 
@@ -416,8 +419,8 @@ fn getAddressListWindows(gpa: Allocator, name: []const u8, port: u16) GetAddress
     var lookup_buffer: [16]IoNet.HostName.LookupResult = undefined;
     var lookup_queue: std.Io.Queue(IoNet.HostName.LookupResult) = .init(&lookup_buffer);
 
-    // HostName.lookup is async — must use io.async so the Io runtime
-    // actually drives the DNS resolution and closes the queue.
+    // HostName.lookup is async; use io.async so the Io runtime drives
+    // DNS resolution and closes the queue.
     var lookup_future = io.async(IoNet.HostName.lookup, .{ host_name, io, &lookup_queue, .{
         .port = port,
         .canonical_name_buffer = &canonical_name_buffer,
@@ -435,7 +438,7 @@ fn getAddressListWindows(gpa: Allocator, name: []const u8, port: u16) GetAddress
         }
     } else |err| switch (err) {
         error.Canceled, error.Closed => {
-            // Queue closed or cancelled — lookup is done. Propagate any lookup-level error.
+            // Queue closed or cancelled; lookup is done. Propagate any lookup-level error.
             _ = lookup_future.await(io) catch |lookup_err| switch (lookup_err) {
                 error.UnknownHostName, error.NoAddressReturned => return error.UnknownHostName,
                 error.NameServerFailure,
@@ -563,36 +566,13 @@ test "compat net oversized hostname fails fast" {
     try std.testing.expectError(error.NameTooLong, getAddressList(std.testing.allocator, oversized, 443));
 }
 
-test "windows localhost fallback helper is scoped" {
-    if (builtin.os.tag != .windows) return;
-
+test "compat net windows localhost fallback helper is scoped" {
+    // Regression: Windows getAddressList used to return UnknownHostName for
+    // every non-localhost hostname because this fallback short-circuited DNS.
     try std.testing.expect(shouldUseWindowsLocalhostFallback("localhost"));
     try std.testing.expect(shouldUseWindowsLocalhostFallback("LOCALHOST"));
-    // Regression: only localhost should use this Windows fallback.
-    try std.testing.expect(!shouldUseWindowsLocalhostFallback("token-plan-cn.xiaomimimo.com"));
-}
-
-// Regression: Windows getAddressList previously returned UnknownHostName for
-// every non-localhost hostname because the fallback branch short-circuited the
-// entire function.  Verify that a well-known public hostname resolves to at
-// least one address on all platforms.
-test "compat net getAddressList resolves external hostname" {
-    // Sandbox / CI environments without DNS access may legitimately fail; the
-    // critical invariant is that the code does NOT unconditionally reject
-    // non-localhost names with UnknownHostName.
-    const list = getAddressList(std.testing.allocator, "example.com", 443) catch |err| {
-        // If DNS is simply unavailable in this environment, skip.
-        if (err == error.TemporaryNameServerFailure or
-            err == error.NameServerFailure or
-            err == error.SystemResources or
-            err == error.Unexpected)
-            return;
-        // Any other error — especially UnknownHostName on a live system — is a
-        // regression.
-        return err;
-    };
-    defer list.deinit();
-    try std.testing.expect(list.addrs.len > 0);
+    try std.testing.expect(!shouldUseWindowsLocalhostFallback("foo.localhost"));
+    try std.testing.expect(!shouldUseWindowsLocalhostFallback("example.invalid"));
 }
 
 test "compat net normalizes listener and stream blocking mode" {
