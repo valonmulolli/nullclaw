@@ -46,6 +46,8 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw agent --workspace /path/to/workspace -m "..."` | Run the agent against a specific workspace for this process |
 | `nullclaw agent --skill news-digest -m "..."` | Run a single prompt with a named skill active |
 | `nullclaw agent` | Start interactive chat mode |
+| `nullclaw acp` | Run the Agent Client Protocol stdio adapter for ACP-compatible editors |
+| `nullclaw acp --provider openai --model gpt-5.2` | Pin the ACP adapter to a provider/model for editor-launched sessions |
 
 ### Interactive model routing
 
@@ -59,6 +61,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 - If no `model_routes` are configured, `/model auto` still clears the pin and returns the session to the configured default model.
 - Starting `nullclaw agent` with `--model` or `--provider` also pins the run and bypasses `model_routes`.
 - Starting `nullclaw agent` with `--skill <name>` activates that skill before the first message or REPL turn.
+- `nullclaw acp` speaks newline-delimited JSON-RPC on stdio. Editors create ACP sessions with an absolute `cwd`; NullClaw forwards that cwd as the workspace for `agent invoke`.
 
 ## Runtime and operations
 
