@@ -463,6 +463,30 @@ pub const Agent = struct {
         return self.allocator.dupe(u8, content);
     }
 
+    fn containsRedactionPlaceholder(text: []const u8) bool {
+        const markers = [_][]const u8{ "[EMAIL_", "[PHONE_", "[CARD_", "[ID_", "[TOKEN_" };
+        for (markers) |marker| {
+            if (std.mem.indexOf(u8, text, marker) != null) return true;
+        }
+        return false;
+    }
+
+    fn historyContainsRedactionPlaceholder(self: *const Agent) bool {
+        for (self.history.items) |msg| {
+            if (containsRedactionPlaceholder(msg.content)) return true;
+        }
+        return false;
+    }
+
+    /// Response cache keys are built from provider-safe text, not raw PII.
+    /// Once governance placeholders are present, different originals can collapse
+    /// to the same prompt shape after a reset, so cache reuse is not semantics-safe.
+    fn responseCacheSafeForTurn(self: *const Agent, safe_user_message: []const u8) bool {
+        if (self.redactor == null) return true;
+        if (containsRedactionPlaceholder(safe_user_message)) return false;
+        return !self.historyContainsRedactionPlaceholder();
+    }
+
     fn drainPendingInjection(self: *Agent) !?[]u8 {
         if (self.drain_injection_cb) |drain_cb| {
             if (self.drain_injection_ctx) |drain_ctx| {
@@ -2007,23 +2031,26 @@ pub const Agent = struct {
         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
 
         // ── Response cache check ──
-        if (self.response_cache) |rc| {
-            var key_buf: [16]u8 = undefined;
-            const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
-                self.history.items[0].content
-            else
-                null;
-            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, turn_model_name, system_prompt, safe_user_message);
-            if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
-                errdefer self.allocator.free(cached_response);
-                const history_copy = try self.dupeForHistory(cached_response);
-                errdefer self.allocator.free(history_copy);
-                try self.history.append(self.allocator, .{
-                    .role = .assistant,
-                    .content = history_copy,
-                });
-                self.last_turn_usage = .{};
-                return cached_response;
+        const response_cache_allowed = self.responseCacheSafeForTurn(safe_user_message);
+        if (response_cache_allowed) {
+            if (self.response_cache) |rc| {
+                var key_buf: [16]u8 = undefined;
+                const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
+                    self.history.items[0].content
+                else
+                    null;
+                const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, turn_model_name, system_prompt, safe_user_message);
+                if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
+                    errdefer self.allocator.free(cached_response);
+                    const history_copy = try self.dupeForHistory(cached_response);
+                    errdefer self.allocator.free(history_copy);
+                    try self.history.append(self.allocator, .{
+                        .role = .assistant,
+                        .content = history_copy,
+                    });
+                    self.last_turn_usage = .{};
+                    return cached_response;
+                }
             }
         }
 
@@ -2533,15 +2560,17 @@ pub const Agent = struct {
                 self.allocator.free(base_text);
 
                 // ── Cache store (only for direct responses, no tool calls) ──
-                if (self.response_cache) |rc| {
-                    var store_key_buf: [16]u8 = undefined;
-                    const sys_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
-                        self.history.items[0].content
-                    else
-                        null;
-                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, safe_user_message);
-                    const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
-                    rc.put(self.allocator, store_key_hex, turn_model_name, final_text, token_count) catch {};
+                if (response_cache_allowed) {
+                    if (self.response_cache) |rc| {
+                        var store_key_buf: [16]u8 = undefined;
+                        const sys_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
+                            self.history.items[0].content
+                        else
+                            null;
+                        const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, safe_user_message);
+                        const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
+                        rc.put(self.allocator, store_key_hex, turn_model_name, final_text, token_count) catch {};
+                    }
                 }
 
                 return final_text;
@@ -11053,6 +11082,81 @@ test "Agent: clearHistory resets redactor placeholder state" {
     defer allocator.free(r2);
     try std.testing.expect(std.mem.indexOf(u8, state.captured_user.?, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.captured_user.?, "[EMAIL_2]") == null);
+}
+
+test "Agent: response cache bypasses redacted prompt placeholders" {
+    // Regression: cache keys built from redacted prompts collapse distinct raw
+    // PII values after a conversation reset (alice -> [EMAIL_1],
+    // bob -> [EMAIL_1]). Governance turns must call the provider again instead
+    // of replaying a response computed for a different original value.
+    const CountingProvider = struct {
+        calls: u32 = 0,
+
+        fn chatWithSystem(_: *anyopaque, alloc: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return alloc.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, alloc: std.mem.Allocator, _: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .content = try std.fmt.allocPrint(alloc, "reply-{d}", .{self.calls}),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try alloc.dupe(u8, model),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "counting-redaction-cache";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = CountingProvider.chatWithSystem,
+        .chat = CountingProvider.chat,
+        .supportsNativeTools = CountingProvider.supportsNativeTools,
+        .getName = CountingProvider.getName,
+        .deinit = CountingProvider.deinitFn,
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = CountingProvider{};
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var response_cache = try cache.ResponseCache.init(":memory:", 60, 1000);
+    defer response_cache.deinit();
+
+    var cfg = redactionBaseConfig(allocator);
+    const profile = config_types.NamedAgentConfig{
+        .name = "redact-cache",
+        .provider = "openrouter",
+        .model = "openrouter/test-model",
+        .enable_pii_redaction = true,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), profile);
+    agent.response_cache = &response_cache;
+    defer agent.deinit();
+
+    const first = try agent.turn("contact alice@example.com");
+    defer allocator.free(first);
+    try std.testing.expectEqualStrings("reply-1", first);
+    try std.testing.expectEqual(@as(u32, 1), provider_state.calls);
+
+    agent.clearHistory();
+
+    const second = try agent.turn("contact bob@example.com");
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings("reply-2", second);
+    try std.testing.expectEqual(@as(u32, 2), provider_state.calls);
 }
 
 test "Agent.redactMessagesForProvider redacts multimodal text and strips image URL queries" {
