@@ -117,7 +117,7 @@ Example:
 ### `models.providers`
 
 - Defines LLM provider connection parameters and API keys.
-- Common providers: `openrouter`, `openai`, `anthropic`, `groq`.
+- Common providers: `openrouter`, `openai`, `anthropic`, `groq`, `nearai`.
 
 Example:
 
@@ -126,6 +126,7 @@ Example:
   "models": {
     "providers": {
       "openrouter": { "api_key": "sk-or-..." },
+      "nearai": { "api_key": "YOUR_NEARAI_API_KEY" },
       "anthropic": { "api_key": "sk-ant-..." },
       "openai": { "api_key": "sk-..." }
     }

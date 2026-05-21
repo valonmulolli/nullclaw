@@ -102,7 +102,7 @@ nullclaw onboard --interactive
 ### `models.providers`
 
 - 定义各 LLM provider 的连接参数与 API Key。
-- 常见 provider：`openrouter`、`openai`、`anthropic`、`groq` 等。
+- 常见 provider：`openrouter`、`openai`、`anthropic`、`groq`、`nearai` 等。
 
 示例：
 
@@ -111,6 +111,7 @@ nullclaw onboard --interactive
   "models": {
     "providers": {
       "openrouter": { "api_key": "sk-or-..." },
+      "nearai": { "api_key": "YOUR_NEARAI_API_KEY" },
       "anthropic": { "api_key": "sk-ant-..." },
       "openai": { "api_key": "sk-..." }
     }

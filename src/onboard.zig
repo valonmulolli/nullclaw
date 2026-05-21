@@ -121,6 +121,7 @@ pub const known_providers = [_]ProviderInfo{
 
     // --- Tier 4: AI platform specialists ---
     .{ .key = "venice", .label = "Venice", .default_model = "llama-4-70b-instruct", .env_var = "VENICE_API_KEY" },
+    .{ .key = "nearai", .label = "NEAR AI Cloud (TEE inference)", .default_model = "zai-org/GLM-5.1-FP8", .env_var = "NEARAI_API_KEY" },
     .{ .key = "moonshot", .label = "Moonshot (Kimi)", .default_model = "kimi-k2.5", .env_var = "MOONSHOT_API_KEY" },
     .{ .key = "xiaomi", .label = "Xiaomi MiMo", .default_model = "mimo-v2-pro", .env_var = "MIMO_API_KEY" },
     .{ .key = "synthetic", .label = "Synthetic", .default_model = "synthetic-model", .env_var = "SYNTHETIC_API_KEY" },
@@ -446,6 +447,7 @@ const claude_cli_fallback = [_][]const u8{
 };
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
+const NEARAI_MODELS_URL = "https://cloud-api.near.ai/v1/model/list";
 
 const ModelsDevProvider = struct {
     canonical: []const u8,
@@ -596,6 +598,8 @@ fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8,
     } else if (std.mem.eql(u8, canonical, "groq")) {
         url = "https://api.groq.com/openai/v1/models";
         needs_auth = true;
+    } else if (std.mem.eql(u8, canonical, "nearai")) {
+        return try fetchAndParseNearAiModels(allocator, canonical, NEARAI_MODELS_URL);
     } else if (std.mem.startsWith(u8, canonical, "http://") or std.mem.startsWith(u8, canonical, "https://")) {
         url_to_free = try buildModelsUrl(allocator, canonical);
         url = url_to_free.?;
@@ -730,6 +734,98 @@ fn jsonStringArrayContains(value: std.json.Value, needle: []const u8) bool {
         if (item == .string and std.mem.eql(u8, item.string, needle)) return true;
     }
     return false;
+}
+
+fn jsonArrayIsEmpty(value: std.json.Value) bool {
+    return value == .array and value.array.items.len == 0;
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn nearAiModelSupportsChat(model_id: []const u8, model_obj: std.json.ObjectMap) bool {
+    if (std.ascii.eqlIgnoreCase(model_id, "openai/privacy-filter")) return false;
+    if (containsAsciiIgnoreCase(model_id, "reranker")) return false;
+    if (containsAsciiIgnoreCase(model_id, "whisper")) return false;
+
+    const metadata_val = model_obj.get("metadata") orelse return true;
+    if (metadata_val != .object) return true;
+
+    const architecture_val = metadata_val.object.get("architecture") orelse return true;
+    if (architecture_val != .object) return true;
+
+    const input_val = architecture_val.object.get("inputModalities");
+    const output_val = architecture_val.object.get("outputModalities");
+
+    if (input_val) |input| {
+        if (jsonStringArrayContains(input, "audio")) return false;
+    }
+    if (output_val) |output| {
+        if (jsonStringArrayContains(output, "embedding")) return false;
+        if (jsonStringArrayContains(output, "image")) return false;
+        if (!jsonStringArrayContains(output, "text")) return false;
+    }
+    if (input_val != null and output_val != null and jsonArrayIsEmpty(input_val.?) and jsonArrayIsEmpty(output_val.?)) {
+        return false;
+    }
+
+    return true;
+}
+
+fn parseNearAiModelIds(allocator: std.mem.Allocator, json_response: []const u8) ![][]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch return error.FetchFailed;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return error.FetchFailed;
+    const models = root.object.get("models") orelse return error.FetchFailed;
+    if (models != .array) return error.FetchFailed;
+
+    var result: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (result.items) |item| allocator.free(item);
+        result.deinit(allocator);
+    }
+
+    for (models.array.items) |item| {
+        if (item != .object) continue;
+        const model_id_val = item.object.get("modelId") orelse continue;
+        if (model_id_val != .string) continue;
+        if (!nearAiModelSupportsChat(model_id_val.string, item.object)) continue;
+        try result.append(allocator, try allocator.dupe(u8, model_id_val.string));
+    }
+
+    sortModelIds(result.items);
+    return result.toOwnedSlice(allocator);
+}
+
+fn fetchAndParseNearAiModels(allocator: std.mem.Allocator, provider: []const u8, url: []const u8) ![][]const u8 {
+    const response = http_util.curlGet(allocator, url, &.{}, "10") catch |err| {
+        logModelCatalogFailureErr(url, provider, err);
+        return error.FetchFailed;
+    };
+    defer allocator.free(response);
+
+    if (response.len == 0) {
+        logModelCatalogFailure(url, provider, "empty response body");
+        return error.FetchFailed;
+    }
+
+    const models = try parseNearAiModelIds(allocator, response);
+    if (models.len == 0) {
+        allocator.free(models);
+        logModelCatalogFailure(url, provider, "no chat-capable models found");
+        return error.FetchFailed;
+    }
+    return models;
 }
 
 fn fetchAndParseModels(allocator: std.mem.Allocator, provider: []const u8, url: []const u8, headers: []const []const u8, prefix_filter: ?[]const u8) ![][]const u8 {
@@ -3357,6 +3453,7 @@ test "defaultModelForProvider returns known models" {
     try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("openai"));
     try std.testing.expectEqualStrings("gpt-5.2-chat", defaultModelForProvider("azure"));
     try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
+    try std.testing.expectEqualStrings("zai-org/GLM-5.1-FP8", defaultModelForProvider("nearai"));
     try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("xiaomi"));
     try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("mimo"));
     try std.testing.expectEqualStrings("llama4", defaultModelForProvider("ollama"));
@@ -3373,6 +3470,7 @@ test "providerEnvVar known providers" {
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", providerEnvVar("anthropic"));
     try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai"));
     try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvVar("azure"));
+    try std.testing.expectEqualStrings("NEARAI_API_KEY", providerEnvVar("nearai"));
     try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvVar("xiaomi"));
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("ollama"));
 }
@@ -4621,6 +4719,10 @@ test "fallbackModelsForProvider uses provider defaults for uncataloged providers
     const z_ai_models = fallbackModelsForProvider("z.ai");
     try std.testing.expect(z_ai_models.len >= 1);
     try std.testing.expectEqualStrings("glm-5", z_ai_models[0]);
+
+    const nearai_models = fallbackModelsForProvider("nearai");
+    try std.testing.expect(nearai_models.len >= 1);
+    try std.testing.expectEqualStrings("zai-org/GLM-5.1-FP8", nearai_models[0]);
 }
 
 test "parseModelIds extracts IDs from OpenRouter-style response and sorts them" {
@@ -4734,6 +4836,70 @@ test "parseModelIds skips entries without id" {
     try std.testing.expect(models.len == 2);
     try std.testing.expectEqualStrings("model-a", models[0]);
     try std.testing.expectEqualStrings("model-b", models[1]);
+}
+
+test "parseNearAiModelIds extracts chat models and filters non-chat entries" {
+    const json =
+        \\{"models": [
+        \\  {
+        \\    "modelId": "zai-org/GLM-5.1-FP8",
+        \\    "metadata": {
+        \\      "architecture": {
+        \\        "inputModalities": ["text"],
+        \\        "outputModalities": ["text"]
+        \\      }
+        \\    }
+        \\  },
+        \\  {
+        \\    "modelId": "openai/privacy-filter",
+        \\    "metadata": {
+        \\      "architecture": {
+        \\        "inputModalities": ["text"],
+        \\        "outputModalities": ["text"]
+        \\      }
+        \\    }
+        \\  },
+        \\  {
+        \\    "modelId": "Qwen/Qwen3-Embedding-0.6B",
+        \\    "metadata": {
+        \\      "architecture": {
+        \\        "inputModalities": ["text"],
+        \\        "outputModalities": ["embedding"]
+        \\      }
+        \\    }
+        \\  },
+        \\  {
+        \\    "modelId": "black-forest-labs/FLUX.2-klein-4B",
+        \\    "metadata": {
+        \\      "architecture": {
+        \\        "inputModalities": ["text"],
+        \\        "outputModalities": ["image"]
+        \\      }
+        \\    }
+        \\  },
+        \\  {
+        \\    "modelId": "openai/whisper-large-v3",
+        \\    "metadata": {
+        \\      "architecture": {
+        \\        "inputModalities": ["audio"],
+        \\        "outputModalities": ["text"]
+        \\      }
+        \\    }
+        \\  },
+        \\  {"modelId": "Qwen/Qwen3-Reranker-0.6B"},
+        \\  {"modelId": "incomplete/empty", "metadata": {"architecture": {"inputModalities": [], "outputModalities": []}}},
+        \\  {"modelId": "anthropic/claude-opus-4-7"}
+        \\]}
+    ;
+    const models = try parseNearAiModelIds(std.testing.allocator, json);
+    defer {
+        for (models) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(models);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4-7", models[0]);
+    try std.testing.expectEqualStrings("zai-org/GLM-5.1-FP8", models[1]);
 }
 
 test "cache read returns error for missing file" {
