@@ -41,10 +41,15 @@ pub const MemoryListTool = struct {
         else
             null;
 
+        // Default to `null` (list across all sessions, including globals
+        // with session_id = NULL) when the caller does not pin a specific
+        // session. Previously this implicitly substituted the current
+        // thread's session, which made global entries — and the `core`
+        // category — invisible to the tool.
         const session_id_opt: ?[]const u8 = if (root.getString(args, "session_id")) |sid_raw|
-            if (sid_raw.len > 0) sid_raw else root.threadMemorySessionId()
+            if (sid_raw.len > 0) sid_raw else null
         else
-            root.threadMemorySessionId();
+            null;
 
         const include_content = root.getBool(args, "include_content") orelse true;
         const include_internal = root.getBool(args, "include_internal") orelse false;
@@ -194,6 +199,63 @@ test "memory_list filters bootstrap internal keys by default" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "user_topic") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "__bootstrap.prompt.AGENTS.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "internal-agents") == null);
+}
+
+test "memory_list returns global entries when thread session is set (regression #917)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Global entries — stored with session_id = NULL.
+    try mem.store("user_language", "ru", .core, null);
+    try mem.store("user_topic", "shipping", .core, null);
+    // Session-scoped entry.
+    try mem.store("recent_message", "hi", .conversation, "session:42");
+
+    // Simulate the production code path: a running agent has its
+    // thread session id set. Before the fix, this caused memory_list
+    // to inject "session:42" as the filter, hiding the two globals.
+    const previous = root.setThreadMemorySessionId("session:42");
+    defer _ = root.setThreadMemorySessionId(previous);
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "user_language") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "user_topic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "recent_message") != null);
+}
+
+test "memory_list explicit session_id still filters out unrelated entries" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("user_language", "ru", .core, null); // global
+    try mem.store("recent_a", "hi from A", .conversation, "session:A");
+    try mem.store("recent_b", "hi from B", .conversation, "session:B");
+
+    var mt = MemoryListTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"limit\":10,\"session_id\":\"session:A\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "recent_a") != null);
+    // The other session's entry and the global must be excluded when
+    // an explicit session_id is passed — the fix must not turn the
+    // session filter into a no-op.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "recent_b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "user_language") == null);
 }
 
 test "memory_list preview keeps UTF-8 intact at the boundary" {
