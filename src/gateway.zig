@@ -6,7 +6,7 @@
 //!   - Body size limits (configurable, default 64KB)
 //!   - Request timeouts (configurable, default 30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /status, /doctor, /pair, /logout, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
+//!   - Endpoints: /health, /ready, /status, /doctor, /pair, /logout, /webhook, /media/transcribe, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -721,7 +721,8 @@ pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[
     return guard.isAuthenticated(token);
 }
 
-/// Returns true when a generic gateway endpoint (/webhook, /cron, /a2a) should
+/// Returns true when a generic gateway endpoint (/webhook, /cron, /a2a,
+/// /media/transcribe) should
 /// be accepted for the current bind exposure and bearer token. Public binds
 /// always require a valid stored bearer token, even when interactive pairing is
 /// disabled, so generic endpoints cannot silently become anonymous Internet
@@ -5641,7 +5642,7 @@ fn nextAcceptSleepMs(previous_sleep_ms: u64, err: anyerror) u64 {
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, GET /status, GET /doctor, POST /pair, POST /logout, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
+/// Endpoints: GET /health, GET /ready, GET /status, GET /doctor, POST /pair, POST /logout, POST /webhook, POST /media/transcribe, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
 /// `tunnel_url_opt` should contain the daemon's active external tunnel URL when
 /// one is available; a non-null value allows non-loopback binds without setting
@@ -6041,10 +6042,10 @@ pub fn run(
                 const auth_header = extractHeader(raw, "Authorization");
                 const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
                 const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
-                if (!isWebhookAuthorized(pairing_guard, bearer)) {
+                if (!isGenericGatewayEndpointAuthorized(pairing_guard, bearer, public_bind)) {
                     response_status = "401 Unauthorized";
                     response_body = "{\"error\":\"unauthorized\"}";
-                } else if (!state.rate_limiter.allowWebhook(state.allocator, "media/transcribe")) {
+                } else if (!allowScopedWebhook(&state, "media/transcribe", client_identifier)) {
                     response_status = "429 Too Many Requests";
                     response_body = "{\"error\":\"rate limited\"}";
                 } else if (extractBody(raw)) |b| {

@@ -9,7 +9,6 @@ const onboard = @import("onboard.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const config_mod = @import("config.zig");
 const config_paths = @import("config_paths.zig");
-const pairing = @import("security/pairing.zig");
 const Config = config_mod.Config;
 
 const WizardAnswers = struct {
@@ -89,127 +88,19 @@ fn applyChannelsFromString(cfg: *Config, channels_csv: []const u8) void {
     cfg.channels.webhook = if (webhook_selected) .{ .port = cfg.gateway.port } else null;
 }
 
-fn valueBool(value: std.json.Value) ?bool {
-    return if (value == .bool) value.bool else null;
-}
-
-fn valueU64(value: std.json.Value) ?u64 {
-    return switch (value) {
-        .integer => |raw| if (raw >= 0) @intCast(raw) else null,
-        .number_string => |raw| std.fmt.parseInt(u64, raw, 10) catch null,
-        .string => |raw| std.fmt.parseInt(u64, raw, 10) catch null,
-        else => null,
-    };
-}
-
-fn applyGatewayFromObject(cfg: *Config, gateway_obj: std.json.ObjectMap) !void {
-    if (gateway_obj.get("port")) |value| {
-        if (valueU64(value)) |raw| {
-            if (raw > 0 and raw <= std.math.maxInt(u16)) cfg.gateway.port = @intCast(raw);
-        }
-    }
-    if (gateway_obj.get("host")) |value| {
-        if (value == .string) cfg.gateway.host = try cfg.allocator.dupe(u8, value.string);
-    }
-    if (gateway_obj.get("require_pairing")) |value| {
-        if (valueBool(value)) |enabled| cfg.gateway.require_pairing = enabled;
-    }
-    if (gateway_obj.get("allow_public_bind")) |value| {
-        if (valueBool(value)) |enabled| cfg.gateway.allow_public_bind = enabled;
-    }
-    if (gateway_obj.get("pair_rate_limit_per_minute")) |value| {
-        if (valueU64(value)) |raw| cfg.gateway.pair_rate_limit_per_minute = @intCast(@min(raw, @as(u64, std.math.maxInt(u32))));
-    }
-    if (gateway_obj.get("webhook_rate_limit_per_minute")) |value| {
-        if (valueU64(value)) |raw| cfg.gateway.webhook_rate_limit_per_minute = @intCast(@min(raw, @as(u64, std.math.maxInt(u32))));
-    }
-    if (gateway_obj.get("idempotency_ttl_secs")) |value| {
-        if (valueU64(value)) |raw| cfg.gateway.idempotency_ttl_secs = raw;
-    }
-    if (gateway_obj.get("max_body_size_bytes")) |value| {
-        if (valueU64(value)) |raw| cfg.gateway.max_body_size_bytes = @intCast(@min(raw, @as(u64, std.math.maxInt(usize))));
-    }
-    if (gateway_obj.get("request_timeout_secs")) |value| {
-        if (valueU64(value)) |raw| cfg.gateway.request_timeout_secs = raw;
-    }
-    if (gateway_obj.get("paired_tokens")) |value| {
-        if (value == .array) {
-            var tokens: std.ArrayListUnmanaged([]const u8) = .empty;
-            errdefer {
-                for (tokens.items) |token| cfg.allocator.free(token);
-                tokens.deinit(cfg.allocator);
-            }
-            for (value.array.items) |item| {
-                if (item != .string or item.string.len == 0) continue;
-                const token = if (pairing.isTokenHash(item.string))
-                    try cfg.allocator.dupe(u8, item.string)
-                else
-                    try pairing.hashTokenAlloc(cfg.allocator, item.string);
-                tokens.append(cfg.allocator, token) catch |err| {
-                    cfg.allocator.free(token);
-                    return err;
-                };
-            }
-            cfg.gateway.paired_tokens = try tokens.toOwnedSlice(cfg.allocator);
-        }
-    }
-}
-
-fn applyA2aFromObject(cfg: *Config, a2a_obj: std.json.ObjectMap) !void {
-    if (a2a_obj.get("enabled")) |value| {
-        if (valueBool(value)) |enabled| cfg.a2a.enabled = enabled;
-    }
-    if (a2a_obj.get("multi_modal")) |value| {
-        if (valueBool(value)) |enabled| cfg.a2a.multi_modal = enabled;
-    }
-    if (a2a_obj.get("name")) |value| {
-        if (value == .string) cfg.a2a.name = try cfg.allocator.dupe(u8, value.string);
-    }
-    if (a2a_obj.get("description")) |value| {
-        if (value == .string) cfg.a2a.description = try cfg.allocator.dupe(u8, value.string);
-    }
-    if (a2a_obj.get("url")) |value| {
-        if (value == .string) cfg.a2a.url = try cfg.allocator.dupe(u8, value.string);
-    }
-    if (a2a_obj.get("version")) |value| {
-        if (value == .string) cfg.a2a.version = try cfg.allocator.dupe(u8, value.string);
-    }
-}
-
-fn applyRuntimeGatewayFields(cfg: *Config, raw_parsed: ?std.json.Parsed(std.json.Value)) !void {
+fn applyConfigPatchFields(cfg: *Config, raw_parsed: ?std.json.Parsed(std.json.Value)) !void {
     const rp = raw_parsed orelse return;
     if (rp.value != .object) return;
-    if (rp.value.object.get("gateway")) |gateway| {
-        if (gateway == .object) try applyGatewayFromObject(cfg, gateway.object);
-    }
-    if (rp.value.object.get("a2a")) |a2a| {
-        if (a2a == .object) try applyA2aFromObject(cfg, a2a.object);
-    }
-}
-
-fn applyToolsFields(cfg: *Config, raw_parsed: ?std.json.Parsed(std.json.Value)) !void {
-    const rp = raw_parsed orelse return;
-    if (rp.value != .object) return;
-    const tools = rp.value.object.get("tools") orelse return;
-    if (tools != .object) return;
 
     var root_obj: std.json.ObjectMap = .empty;
     defer root_obj.deinit(cfg.allocator);
-    try root_obj.put(cfg.allocator, "tools", tools);
-    const patch_json = try std.json.Stringify.valueAlloc(cfg.allocator, std.json.Value{ .object = root_obj }, .{});
-    defer cfg.allocator.free(patch_json);
-    try cfg.parseJson(patch_json);
-}
+    const patch_fields = [_][]const u8{ "gateway", "a2a", "tools", "memory" };
+    for (patch_fields) |field| {
+        const value = rp.value.object.get(field) orelse continue;
+        if (value == .object) try root_obj.put(cfg.allocator, field, value);
+    }
+    if (root_obj.count() == 0) return;
 
-fn applyMemoryFields(cfg: *Config, raw_parsed: ?std.json.Parsed(std.json.Value)) !void {
-    const rp = raw_parsed orelse return;
-    if (rp.value != .object) return;
-    const memory = rp.value.object.get("memory") orelse return;
-    if (memory != .object) return;
-
-    var root_obj: std.json.ObjectMap = .empty;
-    defer root_obj.deinit(cfg.allocator);
-    try root_obj.put(cfg.allocator, "memory", memory);
     const patch_json = try std.json.Stringify.valueAlloc(cfg.allocator, std.json.Value{ .object = root_obj }, .{});
     defer cfg.allocator.free(patch_json);
     try cfg.parseJson(patch_json);
@@ -695,9 +586,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         cfg.gateway.port = port;
     }
 
-    try applyRuntimeGatewayFields(&cfg, raw_parsed);
-    try applyMemoryFields(&cfg, raw_parsed);
-    try applyToolsFields(&cfg, raw_parsed);
+    try applyConfigPatchFields(&cfg, raw_parsed);
 
     // Apply channels from raw JSON payload.
     // Supports:
@@ -888,7 +777,7 @@ test "applyChannelsFromObject maps single-account webhook channel" {
     try std.testing.expectEqualStrings("sec", cfg.channels.webhook.?.secret.?);
 }
 
-test "applyRuntimeGatewayFields maps NullHub gateway and A2A wizard fields" {
+test "applyConfigPatchFields maps generic wizard config fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -912,40 +801,8 @@ test "applyRuntimeGatewayFields maps NullHub gateway and A2A wizard fields" {
         \\  "a2a": {
         \\    "enabled": true,
         \\    "multi_modal": true,
-        \\    "name": "NullHat"
-        \\  }
-        \\}
-    ;
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-
-    try applyRuntimeGatewayFields(&cfg, parsed);
-    try std.testing.expect(cfg.gateway.require_pairing);
-    try std.testing.expectEqual(@as(usize, 25 * 1024 * 1024), cfg.gateway.max_body_size_bytes);
-    try std.testing.expectEqual(@as(u64, 120), cfg.gateway.request_timeout_secs);
-    try std.testing.expectEqual(@as(u32, 600), cfg.gateway.webhook_rate_limit_per_minute);
-    try std.testing.expectEqual(@as(u64, 30), cfg.gateway.idempotency_ttl_secs);
-    try std.testing.expectEqual(@as(usize, 1), cfg.gateway.paired_tokens.len);
-    try std.testing.expect(pairing.isTokenHash(cfg.gateway.paired_tokens[0]));
-    try std.testing.expect(!std.mem.eql(u8, "nullhub-local-test", cfg.gateway.paired_tokens[0]));
-    try std.testing.expect(cfg.a2a.enabled);
-    try std.testing.expect(cfg.a2a.multi_modal);
-    try std.testing.expectEqualStrings("NullHat", cfg.a2a.name);
-}
-
-test "applyToolsFields maps media audio wizard payload" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var cfg = Config{
-        .workspace_dir = "/tmp",
-        .config_path = "/tmp/config.json",
-        .allocator = allocator,
-    };
-
-    const payload =
-        \\{
+        \\    "name": "Desktop Overlay"
+        \\  },
         \\  "tools": {
         \\    "media": {
         \\      "audio": {
@@ -960,27 +817,7 @@ test "applyToolsFields maps media audio wizard payload" {
         \\        ]
         \\      }
         \\    }
-        \\  }
-        \\}
-    ;
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-
-    try applyToolsFields(&cfg, parsed);
-    try std.testing.expect(cfg.audio_media.enabled);
-    try std.testing.expectEqualStrings("openai", cfg.audio_media.provider);
-    try std.testing.expectEqualStrings("whisper-1", cfg.audio_media.model);
-    try std.testing.expectEqualStrings("en", cfg.audio_media.language.?);
-    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", cfg.audio_media.base_url.?);
-}
-
-test "applyMemoryFields maps stateless object wizard payload" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const answers_payload =
-        \\{
+        \\  },
         \\  "memory": {
         \\    "profile": "minimal_none",
         \\    "backend": "none",
@@ -988,20 +825,25 @@ test "applyMemoryFields maps stateless object wizard payload" {
         \\  }
         \\}
     ;
-    const answers = try std.json.parseFromSlice(WizardAnswers, allocator, answers_payload, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
-    defer answers.deinit();
-    try std.testing.expect(answers.value.memory != null);
-    try std.testing.expect(answers.value.memory.? == .object);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, answers_payload, .{ .allocate = .alloc_always });
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .allocate = .alloc_always });
     defer parsed.deinit();
 
-    var cfg = Config{
-        .workspace_dir = "/tmp",
-        .config_path = "/tmp/config.json",
-        .allocator = allocator,
-    };
-    try applyMemoryFields(&cfg, parsed);
+    try applyConfigPatchFields(&cfg, parsed);
+    try std.testing.expect(cfg.gateway.require_pairing);
+    try std.testing.expectEqual(@as(usize, 25 * 1024 * 1024), cfg.gateway.max_body_size_bytes);
+    try std.testing.expectEqual(@as(u64, 120), cfg.gateway.request_timeout_secs);
+    try std.testing.expectEqual(@as(u32, 600), cfg.gateway.webhook_rate_limit_per_minute);
+    try std.testing.expectEqual(@as(u64, 30), cfg.gateway.idempotency_ttl_secs);
+    try std.testing.expectEqual(@as(usize, 1), cfg.gateway.paired_tokens.len);
+    try std.testing.expectEqualStrings("nullhub-local-test", cfg.gateway.paired_tokens[0]);
+    try std.testing.expect(cfg.a2a.enabled);
+    try std.testing.expect(cfg.a2a.multi_modal);
+    try std.testing.expectEqualStrings("Desktop Overlay", cfg.a2a.name);
+    try std.testing.expect(cfg.audio_media.enabled);
+    try std.testing.expectEqualStrings("openai", cfg.audio_media.provider);
+    try std.testing.expectEqualStrings("whisper-1", cfg.audio_media.model);
+    try std.testing.expectEqualStrings("en", cfg.audio_media.language.?);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", cfg.audio_media.base_url.?);
     try std.testing.expectEqualStrings("minimal_none", cfg.memory.profile);
     try std.testing.expectEqualStrings("none", cfg.memory.backend);
     try std.testing.expect(!cfg.memory.auto_save);

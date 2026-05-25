@@ -15,6 +15,7 @@
 | `/health` | GET | 无 | 健康检查 |
 | `/pair` | POST | `X-Pairing-Code` | 用一次性配对码换取 bearer token（网关公开绑定时仅允许 loopback 客户端） |
 | `/webhook` | POST | `Authorization: Bearer <token>` | 发送消息：`{"message":"..."}` |
+| `/media/transcribe` | POST | `Authorization: Bearer <token>` | 通过已配置的 STT provider 转写 base64 音频负载 |
 | `/cron` | GET | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 查看运行中 daemon 的实时 scheduler 任务 |
 | `/cron/add` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 新增实时 cron 任务 |
 | `/cron/remove` | POST | 公开绑定时或已存在配对 token 时需要 `Authorization: Bearer <token>` | 按 `id` 删除实时 cron 任务 |
@@ -110,6 +111,39 @@ Teams webhook 说明：
 - token 的 issuer 必须是 `https://api.botframework.com`，audience 必须匹配配置中的 Teams `client_id`，并且 token 中的 `serviceUrl` 必须与 activity body 一致。
 - 会按 Bot Framework key metadata 中公布的 endorsement 校验 Teams `channelId`。
 - 如果配置了 `channels.teams[].webhook_secret`，还会额外要求 `X-Webhook-Secret` 精确匹配。
+
+## Media Transcription
+
+`POST /media/transcribe` 面向本地编排器（例如 NullHub）。它使用与 `/webhook` 和 `/a2a` 相同的 bearer-token 鉴权，并通过 `tools.media.audio` 中配置的 STT 模型执行转写。
+
+请求：
+
+```json
+{
+  "audio_base64": "BASE64_AUDIO_BYTES",
+  "mime_type": "audio/webm;codecs=opus",
+  "source": "mic",
+  "language": "en"
+}
+```
+
+响应：
+
+```json
+{
+  "text": "transcribed speech",
+  "source": "mic",
+  "language": "en",
+  "mime_type": "audio/webm;codecs=opus"
+}
+```
+
+说明：
+
+- `audio_base64` 必填；`mime_type` 默认是 `audio/ogg`。
+- 只接受 `audio/*` MIME type。
+- 实时桌面音频分片场景通常需要提高 `gateway.max_body_size_bytes`、`gateway.request_timeout_secs` 和 `gateway.webhook_rate_limit_per_minute`。
+- `tools.media.audio.models[0]` 选择 STT provider、model 和 endpoint。如果该 provider 没有 key，NullClaw 会在可用时回退到已配置 key 的 OpenAI/Groq/Telnyx provider。
 
 ## A2A（Agent-to-Agent 协议）
 
@@ -282,7 +316,7 @@ curl -X POST \
 
 1. 保持 `gateway.require_pairing = true`。
 2. 网关优先绑定 `127.0.0.1`，外网访问通过 tunnel/反向代理。
-3. 如果你刻意绑定到非 loopback 地址，通用端点（`/webhook`、`/cron/*`、`/a2a`）即使关闭了交互式 pairing，也仍然要求已存储的 bearer token；如果不使用 `/pair`，请预先配置 `gateway.paired_tokens`。
+3. 如果你刻意绑定到非 loopback 地址，通用端点（`/webhook`、`/cron/*`、`/a2a`、`/media/transcribe`）即使关闭了交互式 pairing，也仍然要求已存储的 bearer token；如果不使用 `/pair`，请预先配置 `gateway.paired_tokens`。
 4. 如果是非 loopback 绑定，`/pair` 只接受 loopback 客户端；要么先在本机完成初始 pairing，要么在公开端口前预先配置 `gateway.paired_tokens`。
 5. token 视为密钥，不写入公开仓库或日志。
 6. Max webhook secret 同理：每个账号使用独立随机值，不跨 bot 复用。
