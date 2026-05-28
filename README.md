@@ -827,7 +827,7 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 | `cron list\|status\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
 | `skills list\|install\|remove\|info` | Manage skill packs, including `install --name <query>` registry search |
 | `history list\|show` | View session conversation history |
-| `memory stats\|count\|reindex\|search\|get\|list\|drain-outbox\|forget` | Inspect and maintain memory |
+| `memory stats\|count\|reindex\|search\|get\|list\|export-jsonl\|hygiene-report\|drain-outbox\|forget` | Inspect, export, and maintain memory |
 | `hardware scan\|flash\|monitor` | Hardware device management |
 | `config show\|get`, `models list\|summary\|info\|benchmark\|refresh` | Read config/model admin state and manage the model catalog |
 | `workspace edit\|reset-md` | Maintain workspace markdown/bootstrap files |

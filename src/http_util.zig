@@ -36,6 +36,26 @@ pub fn mapCurlExitCodeToError(code: u8) anyerror {
     };
 }
 
+pub fn isCurlTransportError(err: anyerror) bool {
+    return switch (err) {
+        error.CurlDnsError,
+        error.CurlConnectError,
+        error.CurlTimeout,
+        error.CurlTlsError,
+        error.CurlReadError,
+        error.CurlWriteError,
+        error.CurlWaitError,
+        error.CurlFailed,
+        error.CurlInterrupted,
+        => true,
+        else => false,
+    };
+}
+
+pub fn preserveCurlTransportError(err: anyerror, fallback: anyerror) anyerror {
+    return if (isCurlTransportError(err)) err else fallback;
+}
+
 const StderrCapture = struct {
     file: ?std_compat.fs.File = null,
     buffer: [MAX_CURL_STDERR_BYTES]u8 = undefined,
@@ -312,8 +332,8 @@ pub const ProxyHttpClient = struct {
 
 pub const SafeResolveEntryError = Allocator.Error || error{
     InvalidUrl,
-    LocalAddressBlocked,
     HostResolutionFailed,
+    LocalAddressBlocked,
 };
 
 fn defaultPortForScheme(uri: std.Uri) ?u16 {
@@ -350,6 +370,10 @@ fn buildCurlResolveEntry(
 /// Build an optional curl `--resolve` entry for remote provider requests.
 /// Remote hosts are pinned to a concrete globally-routable address; explicit
 /// local/private hosts are left untouched so intentional local providers still work.
+///
+/// DNS resolution failures are fail-closed. Falling back to curl's resolver would
+/// bypass the single resolved-address check and weaken SSRF protection against
+/// DNS answers that resolve to local/private networks.
 pub fn buildSafeResolveEntryForRemoteUrl(
     allocator: Allocator,
     url: []const u8,
@@ -360,11 +384,23 @@ pub fn buildSafeResolveEntryForRemoteUrl(
 
     if (net_security.isLocalHost(host)) return null;
 
-    const connect_host = try net_security.resolveConnectHost(allocator, host, port);
+    const connect_host = net_security.resolveConnectHost(allocator, host, port) catch |err|
+        return mapResolveConnectHostError(host, err);
     defer allocator.free(connect_host);
 
     if (!shouldUsePinnedResolve(host, connect_host)) return null;
     return try buildCurlResolveEntry(allocator, host, port, connect_host);
+}
+
+fn mapResolveConnectHostError(host: []const u8, err: net_security.ResolveConnectHostError) SafeResolveEntryError {
+    return switch (err) {
+        error.HostResolutionFailed => blk: {
+            log.debug("host resolution unavailable for {s}; failing closed", .{host});
+            break :blk error.HostResolutionFailed;
+        },
+        error.LocalAddressBlocked => error.LocalAddressBlocked,
+        error.OutOfMemory => error.OutOfMemory,
+    };
 }
 
 pub fn appendCurlResolveArgs(argv_buf: []([]const u8), argc: *usize, resolve_entry: ?[]const u8) void {
@@ -1232,6 +1268,7 @@ fn putProxyEnvVarFromProcess(
     if (std_compat.process.getEnvVarOwned(allocator, key)) |raw_value| {
         defer allocator.free(raw_value);
         if (try normalizeProxyEnvValue(allocator, raw_value)) |proxy| {
+            defer allocator.free(proxy);
             try env_map.put(key, proxy);
         }
     } else |_| {}
@@ -1453,6 +1490,12 @@ test "buildSafeResolveEntryForRemoteUrl rejects loopback integer alias" {
     try std.testing.expectError(error.LocalAddressBlocked, buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "https://2130706433/v1"));
 }
 
+test "buildSafeResolveEntryForRemoteUrl maps resolution failure to fail closed" {
+    // Regression: do not silently fall back to curl DNS on resolver failure,
+    // because that bypasses private-address screening before --resolve pinning.
+    try std.testing.expect(mapResolveConnectHostError("example.com", error.HostResolutionFailed) == error.HostResolutionFailed);
+}
+
 test "buildSafeResolveEntryForRemoteUrl rejects malformed URL" {
     try std.testing.expectError(error.InvalidUrl, buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "notaurl"));
 }
@@ -1491,6 +1534,25 @@ test "curl exit code mapping returns specific errors" {
     try std.testing.expect(mapCurlExitCodeToError(28) == error.CurlTimeout);
     try std.testing.expect(mapCurlExitCodeToError(60) == error.CurlTlsError);
     try std.testing.expect(mapCurlExitCodeToError(22) == error.CurlFailed);
+}
+
+test "preserveCurlTransportError preserves curl transport failures" {
+    // Regression: provider probes need raw curl transport failures instead of a
+    // provider-specific API error so they can report network_error correctly.
+    try std.testing.expect(preserveCurlTransportError(error.CurlDnsError, error.ApiError) == error.CurlDnsError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlConnectError, error.ApiError) == error.CurlConnectError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlTimeout, error.ApiError) == error.CurlTimeout);
+    try std.testing.expect(preserveCurlTransportError(error.CurlTlsError, error.ApiError) == error.CurlTlsError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlReadError, error.ApiError) == error.CurlReadError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlWriteError, error.ApiError) == error.CurlWriteError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlWaitError, error.ApiError) == error.CurlWaitError);
+    try std.testing.expect(preserveCurlTransportError(error.CurlFailed, error.ApiError) == error.CurlFailed);
+    try std.testing.expect(preserveCurlTransportError(error.CurlInterrupted, error.ApiError) == error.CurlInterrupted);
+}
+
+test "preserveCurlTransportError returns fallback for non-transport failures" {
+    try std.testing.expect(preserveCurlTransportError(error.RateLimited, error.ApiError) == error.ApiError);
+    try std.testing.expect(preserveCurlTransportError(error.InvalidUrl, error.ApiError) == error.ApiError);
 }
 
 test "StderrCapture returns trimmed stderr" {

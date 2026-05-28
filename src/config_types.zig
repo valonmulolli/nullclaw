@@ -398,6 +398,8 @@ pub const AgentConfig = struct {
     /// When true, automatically adds the current model to vision_disabled_models
     /// upon receiving a "model does not support vision" error.
     auto_disable_vision_on_error: bool = true,
+    /// Redact PII in outbound provider messages for the root agent.
+    enable_pii_redaction: bool = true,
 
     pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
         if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;
@@ -1546,6 +1548,17 @@ pub const GatewayConfig = struct {
     /// Default 30s. Raise this when accepting large payloads (e.g. images)
     /// over slow or high-latency connections.
     request_timeout_secs: u64 = 30,
+    /// When true, /webhook requests authenticated with a token from
+    /// `paired_tokens` are routed through the synchronous session-manager
+    /// path instead of being published to the event bus. The caller then
+    /// receives `{"status":"ok","response":"...","thread_events":[...]}`,
+    /// which is the response shape the NullBoiler dispatch contract
+    /// requires from a worker (see `docs/integration-analysis.md` Gap 3).
+    /// Unauthenticated webhooks and webhooks from non-paired bearers
+    /// continue to take the bus path, so existing channel integrations
+    /// (Telegram, Discord, Slack, …) are unaffected. Default false to keep
+    /// behavior unchanged for existing deployments.
+    webhook_sync_for_workers: bool = false,
 };
 
 // ── A2A (Agent-to-Agent) protocol config ────────────────────────
@@ -1741,6 +1754,18 @@ pub const HardwareConfig = struct {
     workspace_datasheets: bool = false,
 };
 
+// ── Workspace audit config ──────────────────────────────────────
+
+pub const WorkspaceAuditTriageConfig = struct {
+    provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    max_calls: ?usize = null,
+};
+
+pub const WorkspaceAuditConfig = struct {
+    llm_triage: WorkspaceAuditTriageConfig = .{},
+};
+
 // ── Security sub-configs ────────────────────────────────────────
 
 pub const SandboxConfig = struct {
@@ -1798,6 +1823,10 @@ pub const NamedAgentConfig = struct {
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
+    /// Redact PII (email, phone, card+Luhn, passport-anchored ID, tokens) in
+    /// outbound provider messages so user data does not leak to remote LLMs.
+    /// Default true (secure-by-default). Disable explicitly for known-local-only agents.
+    enable_pii_redaction: bool = true,
 };
 
 // ── MCP Server Config ──────────────────────────────────────────

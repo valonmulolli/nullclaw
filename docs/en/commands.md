@@ -151,8 +151,21 @@ Notes:
 | `nullclaw memory search "query" --limit 10` | Run retrieval against memory |
 | `nullclaw memory get <key>` | Show one memory entry |
 | `nullclaw memory list --category task --limit 20` | List memory entries by category |
+| `nullclaw memory export-jsonl --limit 1000` | Export a governed, PII-redacted JSONL dataset from memory |
+| `nullclaw memory hygiene-report --json` | Dry-run exact/normalized duplicate report for memory |
 | `nullclaw memory drain-outbox` | Drain the durable vector outbox queue |
 | `nullclaw memory forget <key>` | Delete one memory entry |
+
+`memory export-jsonl` emits one JSON object per line with a stable
+`schema_version`, `key`, `category`, `timestamp`, `session_id`, and `content`
+schema. Bootstrap/autosave internals are excluded unless `--include-internal`
+is passed. Content is PII-redacted by default for DS notebooks, model
+evaluation, and external review; use `--include-pii` only for trusted local raw
+exports.
+
+`memory hygiene-report` is non-destructive. It scans the selected memory slice
+and reports exact duplicates plus normalized duplicates where case and
+whitespace differ. It does not delete or rewrite entries.
 
 ### `workspace`, `capabilities`, `models`, `migrate`
 
@@ -161,6 +174,12 @@ Notes:
 | `nullclaw workspace edit AGENTS.md` | Open a bootstrap markdown file in `$EDITOR` |
 | `nullclaw workspace reset-md --dry-run` | Preview workspace markdown reset |
 | `nullclaw workspace reset-md --include-bootstrap --clear-memory-md` | Reset bundled markdown files and optionally clear extra files |
+| `nullclaw workspace audit` | Scan workspace files for likely secret leaks (token prefixes, PEM blocks, credentials in URLs, high-entropy strings) |
+| `nullclaw workspace audit --staged \| --commit <sha> \| --range a..b` | Audit a staged diff, a historical commit, or a git revision range instead of the workspace tree |
+| `nullclaw workspace audit --json [--only-secrets] [--fail-on <level>]` | Machine-readable output for CI integration; non-zero exit when findings meet the threshold |
+| `nullclaw workspace audit --llm-triage external` | Re-classify findings via `workspace_audit.llm_triage` or the configured primary LLM provider using privacy-preserving envelopes (no raw secret value leaves the machine) |
+| `nullclaw workspace audit --llm-provider ollama --llm-model qwen2.5-coder:7b --llm-max-calls 20` | Override the configured audit triage provider, model, and external-call budget for one run |
+| `nullclaw workspace audit --llm-triage dry-run` | Print the envelopes that would be sent without calling the LLM |
 | `nullclaw capabilities` | Show a text capability summary |
 | `nullclaw capabilities --json` | Show a JSON capability manifest |
 | `nullclaw config show [--json]` | Print the full on-disk config |
