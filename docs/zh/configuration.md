@@ -701,7 +701,7 @@ Max 说明：
   - `host = "127.0.0.1"`
   - `require_pairing = true`
 - 不建议直接公网监听；如需外网访问，优先使用 tunnel。
-- 如果绑定到非 loopback 地址，像 `/webhook`、`/cron/*`、`/a2a` 这类通用网关端点即使关闭了交互式 pairing，也仍然要求已存储的 bearer token，因此应保持 `require_pairing = true`，或者预先配置 `paired_tokens`。
+- 如果绑定到非 loopback 地址，像 `/webhook`、`/cron/*`、`/a2a`、`/media/transcribe` 这类通用网关端点即使关闭了交互式 pairing，也仍然要求已存储的 bearer token，因此应保持 `require_pairing = true`，或者预先配置 `paired_tokens`。
 - 如果绑定到非 loopback 地址，`/pair` 只接受 loopback 客户端；要么先在本机完成初始 pairing，要么在公开端口前预先配置 `paired_tokens`。
 
 | 字段 | 默认值 | 说明 |
@@ -711,9 +711,9 @@ Max 说明：
 | `require_pairing` | `true` | 所有 API 请求均需 bearer token |
 | `allow_public_bind` | `false` | 允许绑定非回环地址 |
 | `pair_rate_limit_per_minute` | `10` | 每 IP 每分钟最大 `/pair` 请求数 |
-| `webhook_rate_limit_per_minute` | `60` | 每 IP 每分钟最大 webhook 请求数 |
+| `webhook_rate_limit_per_minute` | `60` | 每 IP 每分钟最大 webhook-like 鉴权请求数。实时 `/media/transcribe` 音频分片场景可适当调高。 |
 | `idempotency_ttl_secs` | `300` | 幂等请求结果缓存时长（秒） |
-| `max_body_size_bytes` | `65536` | HTTP 请求体最大字节数（64 KB）。接受图片或文件负载时需调高（如 `20971520` 表示 20 MB）。 |
+| `max_body_size_bytes` | `65536` | HTTP 请求体最大字节数（64 KB）。接受图片、音频或文件负载时需调高（如 `67108864` 表示 64 MiB）。 |
 | `request_timeout_secs` | `30` | 入站 HTTP 请求的 socket 读取超时（秒）。在慢速或高延迟连接下接受大体积负载时需调高。 |
 
 ### `tunnel`

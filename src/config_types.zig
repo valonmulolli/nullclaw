@@ -119,6 +119,13 @@ pub const AudioMediaConfig = struct {
     model: []const u8 = "whisper-large-v3",
     base_url: ?[]const u8 = null,
     language: ?[]const u8 = null,
+
+    /// Audio transcription endpoints carry provider credentials. Keep the same
+    /// URL boundary as provider base URLs: HTTPS for remote hosts, plain HTTP
+    /// only for explicit local/private endpoints, and no query/fragment.
+    pub fn isValidBaseUrl(raw: []const u8) bool {
+        return ProviderEntry.isValidBaseUrl(raw);
+    }
 };
 
 // ── Sub-config structs ──────────────────────────────────────────

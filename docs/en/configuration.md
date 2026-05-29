@@ -890,7 +890,7 @@ Recommended defaults:
 - `require_pairing = true`
 
 Avoid direct public exposure. Use tunnel when external access is required.
-On non-loopback binds, generic gateway endpoints such as `/webhook`, `/cron/*`, and `/a2a` still require a stored bearer token even if interactive pairing is disabled, so keep `require_pairing = true` or preconfigure `paired_tokens`.
+On non-loopback binds, generic gateway endpoints such as `/webhook`, `/cron/*`, `/a2a`, and `/media/transcribe` still require a stored bearer token even if interactive pairing is disabled, so keep `require_pairing = true` or preconfigure `paired_tokens`.
 On non-loopback binds, `/pair` only accepts loopback clients; do the initial pairing locally or preconfigure `paired_tokens` before exposing the gateway.
 
 | Field | Default | Description |
@@ -900,9 +900,9 @@ On non-loopback binds, `/pair` only accepts loopback clients; do the initial pai
 | `require_pairing` | `true` | Require bearer token on all API requests |
 | `allow_public_bind` | `false` | Allow binding to non-loopback addresses |
 | `pair_rate_limit_per_minute` | `10` | Max `/pair` requests per minute per IP |
-| `webhook_rate_limit_per_minute` | `60` | Max webhook requests per minute per IP |
+| `webhook_rate_limit_per_minute` | `60` | Max webhook-like authenticated requests per minute. Raise this for live `/media/transcribe` audio chunks. |
 | `idempotency_ttl_secs` | `300` | Duration to cache idempotent request results |
-| `max_body_size_bytes` | `65536` | Maximum HTTP request body size in bytes (64 KB). Raise this when accepting image or file payloads (e.g. `20971520` for 20 MB). |
+| `max_body_size_bytes` | `65536` | Maximum HTTP request body size in bytes (64 KB). Raise this when accepting image, audio, or file payloads (e.g. `67108864` for 64 MiB). |
 | `request_timeout_secs` | `30` | Socket read timeout for incoming HTTP requests in seconds. Raise this when accepting large payloads over slow connections. |
 
 ### `tunnel`

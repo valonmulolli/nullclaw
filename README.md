@@ -762,6 +762,7 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `/health` | GET | None | Health check (always public) |
 | `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}` |
+| `/media/transcribe` | POST | `Authorization: Bearer <token>` | Transcribe `audio_base64` payloads through configured STT |
 | `/.well-known/agent-card.json` | GET | None | A2A Agent Card discovery (public) |
 | `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC endpoint (canonical methods plus legacy slash aliases) |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
@@ -812,6 +813,10 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 ```
 
 See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including streaming, task lifecycle, and configuration details.
+
+### Media transcription
+
+`POST /media/transcribe` accepts JSON with `audio_base64`, `mime_type`, `source`, and optional `language`, then returns `{"text":"..."}` plus metadata. Configure STT under `tools.media.audio`; remote custom STT endpoints must use HTTPS. Raise `gateway.max_body_size_bytes`, `gateway.request_timeout_secs`, and `gateway.webhook_rate_limit_per_minute` for live desktop audio chunking.
 
 ## Commands
 

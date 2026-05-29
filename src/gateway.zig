@@ -6,7 +6,7 @@
 //!   - Body size limits (configurable, default 64KB)
 //!   - Request timeouts (configurable, default 30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /status, /doctor, /pair, /logout, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
+//!   - Endpoints: /health, /ready, /status, /doctor, /pair, /logout, /webhook, /media/transcribe, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -45,6 +45,8 @@ const a2a = @import("a2a.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const cron_mod = @import("cron.zig");
+const platform = @import("platform.zig");
+const voice = @import("voice.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const log = std.log.scoped(.gateway);
@@ -58,6 +60,7 @@ pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 const ACCEPT_POLL_INTERVAL_MS: u64 = 100;
 const ACCEPT_ERROR_BACKOFF_MAX_MS: u64 = 1_000;
 const ACCEPT_ERROR_LOG_INTERVAL: u32 = 20;
+const MEDIA_TRANSCRIBE_MAX_AUDIO_BYTES: usize = 24 * 1024 * 1024;
 
 /// Sliding window for rate limiting (60s).
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -720,7 +723,8 @@ pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[
     return guard.isAuthenticated(token);
 }
 
-/// Returns true when a generic gateway endpoint (/webhook, /cron, /a2a) should
+/// Returns true when a generic gateway endpoint (/webhook, /cron, /a2a,
+/// /media/transcribe) should
 /// be accepted for the current bind exposure and bearer token. Public binds
 /// always require a valid stored bearer token, even when interactive pairing is
 /// disabled, so generic endpoints cannot silently become anonymous Internet
@@ -973,6 +977,278 @@ fn buildWebhookSuccessResponse(
     try w.writeByte('}');
     buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
+}
+
+const MediaTranscribeResult = struct {
+    status: []const u8,
+    body: []const u8,
+};
+
+const MediaTranscribeRequest = struct {
+    audio_base64: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+    source: ?[]const u8 = null,
+    language: ?[]const u8 = null,
+};
+
+fn mediaExtensionForMime(mime_type: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, mime_type, "wav") != null) return "wav";
+    if (std.mem.indexOf(u8, mime_type, "mpeg") != null or std.mem.indexOf(u8, mime_type, "mp3") != null) return "mp3";
+    if (std.mem.indexOf(u8, mime_type, "webm") != null) return "webm";
+    if (std.mem.indexOf(u8, mime_type, "mp4") != null or std.mem.indexOf(u8, mime_type, "m4a") != null) return "m4a";
+    if (std.mem.indexOf(u8, mime_type, "ogg") != null or std.mem.indexOf(u8, mime_type, "opus") != null) return "ogg";
+    return "bin";
+}
+
+fn isSafeMediaMimeType(mime_type: []const u8) bool {
+    if (mime_type.len == 0 or mime_type.len > 128) return false;
+    if (!std.mem.startsWith(u8, mime_type, "audio/")) return false;
+    for (mime_type) |ch| {
+        if (ch < 0x20 or ch == 0x7f) return false;
+    }
+    return true;
+}
+
+fn decodeBase64Alloc(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    if (data.len == 0) return error.InvalidBase64;
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data) catch return error.InvalidBase64;
+    if (decoded_len > MEDIA_TRANSCRIBE_MAX_AUDIO_BYTES) return error.AudioTooLarge;
+    const decoded = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, data) catch return error.InvalidBase64;
+    return decoded;
+}
+
+fn writeTempAudioFile(
+    allocator: std.mem.Allocator,
+    audio: []const u8,
+    mime_type: []const u8,
+) ![]u8 {
+    const tmp_dir = try platform.getTempDir(allocator);
+    defer allocator.free(tmp_dir);
+    const ext = mediaExtensionForMime(mime_type);
+    var attempts: usize = 0;
+    while (attempts < 16) : (attempts += 1) {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}{c}nullclaw_media_{x}.{s}",
+            .{ tmp_dir, std.fs.path.sep, std_compat.crypto.random.int(u64), ext },
+        );
+        const file = std_compat.fs.createFileAbsolute(path, .{
+            .read = false,
+            .truncate = false,
+            .exclusive = true,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(path);
+                continue;
+            },
+            else => {
+                allocator.free(path);
+                return err;
+            },
+        };
+        errdefer {
+            std_compat.fs.deleteFileAbsolute(path) catch {};
+            allocator.free(path);
+        }
+        defer file.close();
+        try file.writeAll(audio);
+        return path;
+    }
+    return error.TempFileUnavailable;
+}
+
+fn appendOptionalMediaMetadata(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    value: ?[]const u8,
+) !void {
+    if (value) |v| {
+        try buf.append(allocator, ',');
+        try buf.append(allocator, '"');
+        try buf.appendSlice(allocator, key);
+        try buf.appendSlice(allocator, "\":");
+        try root_mod.json_util.appendJsonString(buf, allocator, v);
+    }
+}
+
+fn buildMediaTranscribeJson(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    source: ?[]const u8,
+    language: ?[]const u8,
+    mime_type: ?[]const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"text\":");
+    try root_mod.json_util.appendJsonString(&buf, allocator, text);
+    try appendOptionalMediaMetadata(&buf, allocator, "source", source);
+    try appendOptionalMediaMetadata(&buf, allocator, "language", language);
+    try appendOptionalMediaMetadata(&buf, allocator, "mime_type", mime_type);
+    try buf.append(allocator, '}');
+    return buf.toOwnedSlice(allocator);
+}
+
+const MediaTranscriptionAccess = struct {
+    provider: []const u8,
+    api_key: []const u8,
+    endpoint: []const u8,
+    model: []const u8,
+
+    fn deinit(self: *const MediaTranscriptionAccess, allocator: std.mem.Allocator) void {
+        allocator.free(self.endpoint);
+    }
+};
+
+fn supportsAudioTranscriptionProvider(provider: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(provider, "openai") or
+        std.ascii.eqlIgnoreCase(provider, "groq") or
+        std.ascii.eqlIgnoreCase(provider, "telnyx");
+}
+
+fn defaultAudioTranscriptionModel(provider: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(provider, "openai")) return "whisper-1";
+    if (std.ascii.eqlIgnoreCase(provider, "telnyx")) return "distil-whisper/distil-large-v2";
+    return "whisper-large-v3";
+}
+
+fn customProviderBaseUrl(provider: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, provider, "custom:")) return provider["custom:".len..];
+    return null;
+}
+
+fn resolveMediaTranscriptionEndpoint(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    provider: []const u8,
+    explicit_audio_endpoint: ?[]const u8,
+) !?[]u8 {
+    if (explicit_audio_endpoint) |endpoint| return try allocator.dupe(u8, endpoint);
+    if (cfg.getProviderBaseUrl(provider)) |base_url| {
+        return try voice.transcriptionEndpointFromBaseUrl(allocator, base_url);
+    }
+    if (customProviderBaseUrl(provider)) |base_url| {
+        return try voice.transcriptionEndpointFromBaseUrl(allocator, base_url);
+    }
+    if (supportsAudioTranscriptionProvider(provider)) {
+        return try allocator.dupe(u8, voice.resolveTranscriptionEndpoint(provider, null));
+    }
+    return null;
+}
+
+fn resolveMediaAccessForProvider(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    provider: []const u8,
+    model: []const u8,
+    explicit_audio_endpoint: ?[]const u8,
+) !?MediaTranscriptionAccess {
+    const api_key = cfg.getProviderKey(provider) orelse return null;
+    const endpoint = (try resolveMediaTranscriptionEndpoint(allocator, cfg, provider, explicit_audio_endpoint)) orelse return null;
+    errdefer allocator.free(endpoint);
+    return .{
+        .provider = provider,
+        .api_key = api_key,
+        .endpoint = endpoint,
+        .model = model,
+    };
+}
+
+fn mediaProviderAlreadyTried(provider: []const u8, tried: []const []const u8) bool {
+    for (tried) |candidate| {
+        if (std.ascii.eqlIgnoreCase(provider, candidate)) return true;
+    }
+    return false;
+}
+
+fn resolveMediaTranscriptionAccess(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+) !?MediaTranscriptionAccess {
+    const configured_provider = cfg.audio_media.provider;
+    if (try resolveMediaAccessForProvider(allocator, cfg, configured_provider, cfg.audio_media.model, cfg.audio_media.base_url)) |access| {
+        return access;
+    }
+
+    const primary_candidates = [_][]const u8{ cfg.default_provider, "openai", "groq", "telnyx" };
+    for (primary_candidates) |provider| {
+        if (std.ascii.eqlIgnoreCase(provider, configured_provider)) continue;
+        const model = if (supportsAudioTranscriptionProvider(provider))
+            defaultAudioTranscriptionModel(provider)
+        else
+            cfg.audio_media.model;
+        if (try resolveMediaAccessForProvider(allocator, cfg, provider, model, null)) |access| {
+            return access;
+        }
+    }
+
+    for (cfg.providers) |entry| {
+        if (entry.base_url == null and customProviderBaseUrl(entry.name) == null) continue;
+        if (mediaProviderAlreadyTried(entry.name, primary_candidates[0..]) or std.ascii.eqlIgnoreCase(entry.name, configured_provider)) continue;
+        if (try resolveMediaAccessForProvider(allocator, cfg, entry.name, cfg.audio_media.model, null)) |access| {
+            return access;
+        }
+    }
+    return null;
+}
+
+fn handleMediaTranscribe(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    cfg: *const Config,
+) MediaTranscribeResult {
+    if (!cfg.audio_media.enabled) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"audio transcription disabled\"}" };
+    }
+
+    var parsed = std.json.parseFromSlice(MediaTranscribeRequest, allocator, body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid JSON body\"}" };
+    defer parsed.deinit();
+
+    const audio_b64 = parsed.value.audio_base64 orelse
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"audio_base64 is required\"}" };
+    const mime_type = parsed.value.mime_type orelse "audio/ogg";
+    if (!isSafeMediaMimeType(mime_type)) {
+        return .{ .status = "415 Unsupported Media Type", .body = "{\"error\":\"unsupported audio mime_type\"}" };
+    }
+    const audio = decodeBase64Alloc(allocator, audio_b64) catch |err| switch (err) {
+        error.AudioTooLarge => return .{ .status = "413 Payload Too Large", .body = "{\"error\":\"audio payload too large\"}" },
+        else => return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid audio_base64\"}" },
+    };
+    defer allocator.free(audio);
+
+    const access = (resolveMediaTranscriptionAccess(allocator, cfg) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"audio provider resolution failed\"}" }) orelse
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"audio provider key not configured\"}" };
+    defer access.deinit(allocator);
+    const language = parsed.value.language orelse cfg.audio_media.language;
+
+    const temp_path = writeTempAudioFile(allocator, audio, mime_type) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to stage audio\"}" };
+    defer {
+        std_compat.fs.deleteFileAbsolute(temp_path) catch {};
+        allocator.free(temp_path);
+    }
+
+    const ext = mediaExtensionForMime(mime_type);
+    var filename_buf: [64]u8 = undefined;
+    const filename = std.fmt.bufPrint(&filename_buf, "audio.{s}", .{ext}) catch "audio.bin";
+    const text = voice.transcribeFile(allocator, access.api_key, access.endpoint, temp_path, .{
+        .model = access.model,
+        .language = language,
+        .mime_type = mime_type,
+        .filename = filename,
+    }) catch return .{ .status = "502 Bad Gateway", .body = "{\"error\":\"audio transcription failed\"}" };
+    defer allocator.free(text);
+
+    const response = buildMediaTranscribeJson(allocator, text, parsed.value.source, language, parsed.value.mime_type) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"failed to render response\"}" };
+    return .{ .status = "200 OK", .body = response };
 }
 
 /// Build a JSON challenge response: `{"challenge":"<escaped>"}`.
@@ -5383,6 +5659,52 @@ fn spawnA2aStreamingWorker(
     thread.detach();
 }
 
+const MediaTranscribeWorker = struct {
+    allocator: std.mem.Allocator,
+    body: []u8,
+    stream: std_compat.net.Stream,
+    config: *const Config,
+
+    fn run(self: *@This()) void {
+        defer self.stream.close();
+        defer self.allocator.free(self.body);
+        defer self.allocator.destroy(self);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req_allocator = arena.allocator();
+        const resp = handleMediaTranscribe(req_allocator, self.body, self.config);
+        writeHttpResponse(&self.stream, resp.status, CONTENT_TYPE_JSON, resp.body);
+    }
+};
+
+fn spawnMediaTranscribeWorker(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    stream: std_compat.net.Stream,
+    config: *const Config,
+) !void {
+    const worker = try allocator.create(MediaTranscribeWorker);
+    errdefer allocator.destroy(worker);
+
+    const owned_body = try allocator.dupe(u8, body);
+    errdefer allocator.free(owned_body);
+
+    worker.* = .{
+        .allocator = allocator,
+        .body = owned_body,
+        .stream = stream,
+        .config = config,
+    };
+
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = thread_stacks.CONTROL_LOOP_STACK_SIZE },
+        MediaTranscribeWorker.run,
+        .{worker},
+    );
+    thread.detach();
+}
+
 // ── Shared scheduler state for cross-thread access ───────────────
 
 var g_shared_scheduler: ?*cron_mod.CronScheduler = null;
@@ -5430,7 +5752,7 @@ fn probeGatewayAddressAvailable(addr: std_compat.net.Address) !void {
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, GET /status, GET /doctor, POST /pair, POST /logout, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
+/// Endpoints: GET /health, GET /ready, GET /status, GET /doctor, POST /pair, POST /logout, POST /webhook, POST /media/transcribe, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
 /// `tunnel_url_opt` should contain the daemon's active external tunnel URL when
 /// one is available; a non-null value allows non-loopback binds without setting
@@ -5815,6 +6137,38 @@ pub fn run(
                     }
                 }
             }
+        } else if (std.mem.eql(u8, base_path, "/media/transcribe")) {
+            // Local media transcription endpoint for gateway clients.
+            if (!is_post) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (config_opt == null) {
+                response_status = "404 Not Found";
+                response_body = "{\"error\":\"not configured\"}";
+            } else {
+                const auth_header = extractHeader(raw, "Authorization");
+                const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+                const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+                if (!isGenericGatewayEndpointAuthorized(pairing_guard, bearer, public_bind)) {
+                    response_status = "401 Unauthorized";
+                    response_body = "{\"error\":\"unauthorized\"}";
+                } else if (!allowScopedWebhook(&state, "media/transcribe", client_identifier)) {
+                    response_status = "429 Too Many Requests";
+                    response_body = "{\"error\":\"rate limited\"}";
+                } else if (extractBody(raw)) |b| {
+                    if (spawnMediaTranscribeWorker(allocator, b, conn.stream, config_opt.?)) {
+                        close_conn = false;
+                        response_status = "";
+                        response_body = "";
+                    } else |_| {
+                        response_status = "503 Service Unavailable";
+                        response_body = "{\"error\":\"transcription worker unavailable\"}";
+                    }
+                } else {
+                    response_status = "400 Bad Request";
+                    response_body = "{\"error\":\"empty body\"}";
+                }
+            }
         } else if (control_route_map.get(base_path)) |route| switch (route) {
             .health => {
                 response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
@@ -6023,6 +6377,141 @@ test "cron auth matrix: no pairing guard allows all" {
     // When pairing is not configured, admin routes stay open.
     try std.testing.expect(isWebhookAuthorized(null, null) == false); // webhook still fails
     try std.testing.expect(isAdminRouteAuthorized(null, null));
+}
+
+test "media transcription helpers decode base64 and render json" {
+    const decoded = try decodeBase64Alloc(std.testing.allocator, "aGVsbG8=");
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("hello", decoded);
+
+    const body = try buildMediaTranscribeJson(std.testing.allocator, "hello", "mic", "en", "audio/wav");
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("{\"text\":\"hello\",\"source\":\"mic\",\"language\":\"en\",\"mime_type\":\"audio/wav\"}", body);
+}
+
+test "media transcription rejects unsafe mime before provider lookup" {
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.audio_media.enabled = true;
+
+    const resp = handleMediaTranscribe(
+        std.testing.allocator,
+        "{\"audio_base64\":\"aGVsbG8=\",\"mime_type\":\"text/plain\"}",
+        &cfg,
+    );
+    try std.testing.expectEqualStrings("415 Unsupported Media Type", resp.status);
+    try std.testing.expectEqualStrings("{\"error\":\"unsupported audio mime_type\"}", resp.body);
+}
+
+test "media transcription rejects control characters in mime type" {
+    try std.testing.expect(isSafeMediaMimeType("audio/wav"));
+    try std.testing.expect(isSafeMediaMimeType("audio/webm;codecs=opus"));
+    try std.testing.expect(!isSafeMediaMimeType("text/plain"));
+    try std.testing.expect(!isSafeMediaMimeType("audio/wav\r\nX-Test: injected"));
+}
+
+test "media transcription falls back to keyed provider" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "openai", .api_key = "sk-test" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.default_provider = "openai";
+    cfg.audio_media.provider = "groq";
+    cfg.audio_media.model = "whisper-large-v3";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("openai", access.provider);
+    try std.testing.expectEqualStrings("sk-test", access.api_key);
+    try std.testing.expectEqualStrings("whisper-1", access.model);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", access.endpoint);
+}
+
+test "media transcription ignores unsupported configured provider without explicit endpoint" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic", .api_key = "anthropic-test" },
+        .{ .name = "openai", .api_key = "sk-test" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.default_provider = "openai";
+    cfg.audio_media.provider = "anthropic";
+    cfg.audio_media.model = "whisper-large-v3";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("openai", access.provider);
+    try std.testing.expectEqualStrings("sk-test", access.api_key);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", access.endpoint);
+}
+
+test "media transcription allows custom configured provider with explicit endpoint" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "local-stt", .api_key = "local-key" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.audio_media.provider = "local-stt";
+    cfg.audio_media.model = "whisper-custom";
+    cfg.audio_media.base_url = "http://127.0.0.1:8080/transcribe";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("local-stt", access.provider);
+    try std.testing.expectEqualStrings("local-key", access.api_key);
+    try std.testing.expectEqualStrings("whisper-custom", access.model);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/transcribe", access.endpoint);
+}
+
+test "media transcription derives endpoint from provider base url" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "openai", .api_key = "sk-test", .base_url = "https://proxy.example/v1" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.audio_media.provider = "openai";
+    cfg.audio_media.model = "whisper-1";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("openai", access.provider);
+    try std.testing.expectEqualStrings("sk-test", access.api_key);
+    try std.testing.expectEqualStrings("whisper-1", access.model);
+    try std.testing.expectEqualStrings("https://proxy.example/v1/audio/transcriptions", access.endpoint);
+}
+
+test "media transcription derives endpoint from custom provider base url" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://stt.example/openai/v1", .api_key = "custom-key" },
+    };
+    var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+    cfg.audio_media.provider = "custom:https://stt.example/openai/v1";
+    cfg.audio_media.model = "whisper-custom";
+    cfg.providers = &entries;
+
+    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+    defer access.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("custom:https://stt.example/openai/v1", access.provider);
+    try std.testing.expectEqualStrings("custom-key", access.api_key);
+    try std.testing.expectEqualStrings("whisper-custom", access.model);
+    try std.testing.expectEqualStrings("https://stt.example/openai/v1/audio/transcriptions", access.endpoint);
+}
+
+test "media transcription stages temp file with safe extension" {
+    const path = try writeTempAudioFile(std.testing.allocator, "hello", "audio/wav");
+    defer {
+        std_compat.fs.deleteFileAbsolute(path) catch {};
+        std.testing.allocator.free(path);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, path, "nullclaw_media_") != null);
+    try std.testing.expect(std.mem.endsWith(u8, path, ".wav"));
+
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64);
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("hello", content);
 }
 
 test "cron auth matrix: pairing disabled allows all" {

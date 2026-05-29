@@ -2709,6 +2709,17 @@ test "channel runtime wires security policy into session manager and shell tool"
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
         .autonomy = .{
             .allowed_paths = &allowed_paths,
         },
