@@ -6,27 +6,31 @@ const std_compat = @import("compat");
 
 const log = std.log.scoped(.line);
 
+const MAX_REPLY_TARGET_LEN: usize = 64;
+const MAX_REPLY_TOKEN_LEN: usize = 512;
+const REPLY_TOKEN_CACHE_SIZE: usize = 16;
+const REPLY_TOKEN_TTL_MS: i64 = 30 * std.time.ms_per_s;
+
 const ReplyTokenData = struct {
-    target: [64]u8,
+    target: [MAX_REPLY_TARGET_LEN]u8,
     target_len: u8,
-    token: [512]u8,
+    token: [MAX_REPLY_TOKEN_LEN]u8,
     token_len: u16,
     received_at_ms: i64,
 };
 
 var g_reply_cache_mu: std_compat.sync.Mutex = .{};
-var g_reply_cache: [16]ReplyTokenData = undefined;
+var g_reply_cache: [REPLY_TOKEN_CACHE_SIZE]ReplyTokenData = undefined;
 var g_reply_cache_count: usize = 0;
 
 pub fn cacheReplyToken(target: []const u8, token: []const u8) void {
-    if (target.len > 64 or token.len > 512) return;
+    if (target.len > MAX_REPLY_TARGET_LEN or token.len > MAX_REPLY_TOKEN_LEN) return;
 
     g_reply_cache_mu.lock();
     defer g_reply_cache_mu.unlock();
 
     const now = std_compat.time.milliTimestamp();
 
-    // Check if target already exists in the cache
     var i: usize = 0;
     while (i < g_reply_cache_count) : (i += 1) {
         const cached = &g_reply_cache[i];
@@ -38,7 +42,6 @@ pub fn cacheReplyToken(target: []const u8, token: []const u8) void {
         }
     }
 
-    // If cache has space, add it. Otherwise, evict the oldest entry
     if (g_reply_cache_count < g_reply_cache.len) {
         const cached = &g_reply_cache[g_reply_cache_count];
         @memcpy(cached.target[0..target.len], target);
@@ -66,7 +69,15 @@ pub fn cacheReplyToken(target: []const u8, token: []const u8) void {
     }
 }
 
-pub fn getReplyToken(allocator: std.mem.Allocator, target: []const u8) ?[]const u8 {
+fn removeReplyCacheEntryLocked(index: usize) void {
+    const last = g_reply_cache_count - 1;
+    if (index != last) {
+        g_reply_cache[index] = g_reply_cache[last];
+    }
+    g_reply_cache_count = last;
+}
+
+pub fn takeReplyToken(target: []const u8, out: *[MAX_REPLY_TOKEN_LEN]u8) ?[]const u8 {
     g_reply_cache_mu.lock();
     defer g_reply_cache_mu.unlock();
 
@@ -75,12 +86,23 @@ pub fn getReplyToken(allocator: std.mem.Allocator, target: []const u8) ?[]const 
     while (i < g_reply_cache_count) : (i += 1) {
         const cached = &g_reply_cache[i];
         if (std.mem.eql(u8, cached.target[0..cached.target_len], target)) {
-            if (now - cached.received_at_ms <= 30_000) {
-                return allocator.dupe(u8, cached.token[0..cached.token_len]) catch null;
+            if (now - cached.received_at_ms <= REPLY_TOKEN_TTL_MS) {
+                @memcpy(out[0..cached.token_len], cached.token[0..cached.token_len]);
+                removeReplyCacheEntryLocked(i);
+                return out[0..cached.token_len];
             }
+            removeReplyCacheEntryLocked(i);
+            return null;
         }
     }
     return null;
+}
+
+pub fn resetReplyTokenCacheForTest() void {
+    if (!builtin.is_test) return;
+    g_reply_cache_mu.lock();
+    defer g_reply_cache_mu.unlock();
+    g_reply_cache_count = 0;
 }
 
 fn buildReplyRequestBody(allocator: std.mem.Allocator, reply_token: []const u8, text: []const u8) ![]u8 {
@@ -162,7 +184,7 @@ pub const LineChannel = struct {
 
     // ── Message Sending ────────────────────────────────────────────
 
-    /// Reply to a message using the replyToken (valid for ~30s after event).
+    /// Reply to a message using a LINE replyToken.
     pub fn replyMessage(self: *LineChannel, reply_token: []const u8, text: []const u8) !void {
         if (builtin.is_test) {
             if (std.mem.indexOf(u8, reply_token, "fail_reply") != null or std.mem.indexOf(u8, reply_token, "fail_reply_and_push") != null) {
@@ -214,8 +236,8 @@ pub const LineChannel = struct {
         const is_source_id = target.len == 33 and (target[0] == 'U' or target[0] == 'C' or target[0] == 'R');
 
         if (is_source_id) {
-            if (getReplyToken(self.allocator, target)) |rt| {
-                defer self.allocator.free(rt);
+            var reply_token_buf: [MAX_REPLY_TOKEN_LEN]u8 = undefined;
+            if (takeReplyToken(target, &reply_token_buf)) |rt| {
                 self.replyMessage(rt, text) catch |err| {
                     log.warn("replyMessage failed with cached token ({}), falling back to pushMessage", .{err});
                     try self.pushMessage(target, text);
@@ -307,13 +329,6 @@ pub const LineChannel = struct {
                         const text_val = msg_obj.object.get("text");
                         message_text = if (text_val) |t| (if (t == .string) t.string else null) else null;
                     }
-                }
-            }
-
-            const target_id = if (group_id) |gid| gid else if (room_id) |rid| rid else user_id;
-            if (reply_token) |rt| {
-                if (target_id) |tid| {
-                    cacheReplyToken(tid, rt);
                 }
             }
 
@@ -1169,7 +1184,51 @@ test "verifyLineSignature rejects tampered body" {
     try std.testing.expect(!verifyLineSignature(tampered_body, valid_sig, secret));
 }
 
+test "line parseWebhookEvents does not cache reply tokens" {
+    resetReplyTokenCacheForTest();
+    defer resetReplyTokenCacheForTest();
+
+    const allocator = std.testing.allocator;
+    const target = "U" ++ ("9" ** 32);
+    const payload =
+        \\{"events":[{"type":"message","replyToken":"parse_only_token","source":{"type":"user","userId":"
+    ++ target ++
+        \\"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"Hello"}}]}
+    ;
+
+    const events = try LineChannel.parseWebhookEvents(allocator, payload);
+    defer {
+        for (events) |*e| {
+            var ev = e.*;
+            ev.deinit(allocator);
+        }
+        allocator.free(events);
+    }
+
+    var token_buf: [MAX_REPLY_TOKEN_LEN]u8 = undefined;
+    // Regression: parsing should stay side-effect-free; the gateway caches only
+    // after signature and sender allowlist checks have passed.
+    try std.testing.expect(takeReplyToken(target, &token_buf) == null);
+}
+
+test "line reply token cache take consumes token" {
+    resetReplyTokenCacheForTest();
+    defer resetReplyTokenCacheForTest();
+
+    const target = "U" ++ ("8" ** 32);
+    cacheReplyToken(target, "one_time_token");
+
+    var token_buf: [MAX_REPLY_TOKEN_LEN]u8 = undefined;
+    const token = takeReplyToken(target, &token_buf) orelse return error.TestExpectedEqual;
+    // Regression: LINE replyTokens are one-use, so cached tokens must not be reused.
+    try std.testing.expectEqualStrings("one_time_token", token);
+    try std.testing.expect(takeReplyToken(target, &token_buf) == null);
+}
+
 test "LineChannel sendMessage routing and fallback" {
+    resetReplyTokenCacheForTest();
+    defer resetReplyTokenCacheForTest();
+
     const allocator = std.testing.allocator;
 
     var ch = LineChannel.init(allocator, .{
@@ -1185,7 +1244,7 @@ test "LineChannel sendMessage routing and fallback" {
     try std.testing.expectError(error.LineApiError, ch.sendMessage("fail_reply_longer_token_value_here", "hello"));
     try ch.sendMessage("normal_reply_token_longer_value_here", "hello");
 
-    // 3. Test caching: parse a webhook with a reply token, then call sendMessage on that sourceId.
+    // 3. Test caching: cache a webhook reply token, then call sendMessage on that sourceId.
     const payload =
         \\{"events":[{"type":"message","replyToken":"cached_token_abc","source":{"type":"user","userId":"U1234567890123456789012345_cached"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"Hello"}}]}
     ;
@@ -1197,6 +1256,7 @@ test "LineChannel sendMessage routing and fallback" {
         }
         allocator.free(events);
     }
+    cacheReplyToken(events[0].user_id.?, events[0].reply_token.?);
 
     // Now sendMessage should use the cached token, which routes to replyMessage and succeeds.
     try ch.sendMessage("U1234567890123456789012345_cached", "hello");

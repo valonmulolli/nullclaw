@@ -4388,6 +4388,11 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                 const sk = lineSessionKeyRouted(ctx.req_allocator, &kb, evt, line_cfg_opt, line_account_id);
                 const uid = evt.user_id orelse "unknown";
                 const line_target = lineReplyTarget(evt);
+                if (evt.reply_token) |rt| {
+                    if (!std.mem.eql(u8, line_target, "unknown")) {
+                        channels.line.cacheReplyToken(line_target, rt);
+                    }
+                }
                 var peer_buf: [160]u8 = undefined;
                 const line_peer = linePeerMetadata(evt, &peer_buf);
 
@@ -8398,6 +8403,71 @@ test "lineSenderAllowed denies empty allow_from and permits wildcard" {
     try std.testing.expect(lineSenderAllowed(&.{"*"}, evt));
     try std.testing.expect(lineSenderAllowed(&.{"U123"}, evt));
     try std.testing.expect(!lineSenderAllowed(&.{"U999"}, evt));
+}
+
+test "line webhook caches reply token only after sender allowlist passes" {
+    if (!build_options.enable_channel_line) return error.SkipZigTest;
+
+    channels.line.resetReplyTokenCacheForTest();
+    defer channels.line.resetReplyTokenCacheForTest();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const allowed_id = "U" ++ ("1" ** 32);
+    const blocked_id = "U" ++ ("2" ** 32);
+    const allow_from = [_][]const u8{allowed_id};
+    state.line_allow_from = &allow_from;
+    state.line_access_token = "test-token";
+
+    const blocked_body =
+        \\{"events":[{"type":"message","replyToken":"blocked_reply_token","source":{"type":"user","userId":"
+    ++ blocked_id ++
+        \\"},"timestamp":1700000000000,"message":{"id":"m1","type":"text","text":"blocked"}}]}
+    ;
+    const blocked_raw = "POST /line HTTP/1.1\r\nHost: localhost\r\n\r\n" ++ blocked_body;
+    var blocked_ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = blocked_raw,
+        .method = "POST",
+        .target = "/line",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+        .client_identifier = "blocked-line-test",
+    };
+    handleLineWebhookRoute(&blocked_ctx);
+
+    var token_buf: [512]u8 = undefined;
+    try std.testing.expect(channels.line.takeReplyToken(blocked_id, &token_buf) == null);
+
+    const allowed_body =
+        \\{"events":[{"type":"message","replyToken":"allowed_reply_token","source":{"type":"user","userId":"
+    ++ allowed_id ++
+        \\"},"timestamp":1700000000000,"message":{"id":"m2","type":"text","text":"allowed"}}]}
+    ;
+    const allowed_raw = "POST /line HTTP/1.1\r\nHost: localhost\r\n\r\n" ++ allowed_body;
+    var allowed_ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = allowed_raw,
+        .method = "POST",
+        .target = "/line",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+        .client_identifier = "allowed-line-test",
+    };
+    handleLineWebhookRoute(&allowed_ctx);
+
+    const cached = channels.line.takeReplyToken(allowed_id, &token_buf) orelse return error.TestExpectedEqual;
+    // Regression: disallowed LINE events must not populate the async reply-token cache.
+    try std.testing.expectEqualStrings("allowed_reply_token", cached);
 }
 
 test "telegramChatId extracts nested message.chat.id" {
