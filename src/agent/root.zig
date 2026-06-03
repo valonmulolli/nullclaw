@@ -1847,6 +1847,46 @@ pub const Agent = struct {
     /// Rules:
     ///   - If no filter groups are configured, returns `self.tool_specs` directly (no copy).
     ///   - A tool whose name does NOT start with "mcp_" is always included.
+    /// Build a subset of `self.tools` suitable for the text-based system prompt.
+    /// Only includes built-in tools and MCP tools from `always` filter groups.
+    /// Dynamic-group MCP tools are omitted — their schemas are still available
+    /// via native API tool-calling when the turn keywords match.
+    fn filterToolsForPromptText(self: *const Agent, arena: std.mem.Allocator) ![]const Tool {
+        if (self.tool_filter_groups.len == 0) return self.tools;
+
+        var result: std.ArrayListUnmanaged(Tool) = .empty;
+        errdefer result.deinit(arena);
+
+        for (self.tools) |t| {
+            if (!std.mem.startsWith(u8, t.name(), "mcp_")) {
+                try result.append(arena, t);
+                continue;
+            }
+
+            for (self.tool_filter_groups) |group| {
+                if (group.mode != .always) continue;
+                for (group.tools) |pattern| {
+                    if (globMatch(pattern, t.name())) {
+                        try result.append(arena, t);
+                        break;
+                    }
+                } else continue;
+                break;
+            }
+        }
+
+        return try result.toOwnedSlice(arena);
+    }
+
+    /// Filter and prioritize `self.tool_specs` for the current turn.
+    ///
+    /// Returns a slice allocated from `arena` containing only the specs that should
+    /// be included for this turn.  The returned slice borrows pointers from
+    /// `self.tool_specs` — it must NOT outlive `self.tool_specs`.
+    ///
+    /// Rules:
+    ///   - If no filter groups are configured, returns `self.tool_specs` directly (no copy).
+    ///   - A tool whose name does NOT start with "mcp_" is always included.
     ///   - `always` groups unconditionally include matching MCP tools.
     ///   - `dynamic` groups include matching MCP tools when the user message contains
     ///     at least one of the group's keywords (case-insensitive substring match).
@@ -1976,23 +2016,25 @@ pub const Agent = struct {
                 self.system_prompt_conversation_context_fingerprint != turn_conversation_context_fingerprint);
 
         if (!self.has_system_prompt or conversation_context_changed) {
+            const prompt_tools = try self.filterToolsForPromptText(self.allocator);
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
                 cfg_for_prompt_ptr,
-                self.tools,
+                prompt_tools,
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
 
             const full_system = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
                 .model_name = turn_model_name,
-                .tools = self.tools,
+                .tools = prompt_tools,
                 .timezone = if (cfg_for_prompt_ptr) |cfg_ptr| cfg_ptr.agent.timezone else "UTC",
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
                 .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
                 .observer = self.observer,
+                .native_tools_enabled = self.provider.supportsNativeTools(),
             });
             const active_skill_section = try commands.buildActiveSkillPromptSection(self);
             defer if (active_skill_section) |section| self.allocator.free(section);
@@ -10476,6 +10518,140 @@ test "priorityToolForSpecsMessage ignores tools excluded from turn specs" {
     try std.testing.expectEqualStrings("shell", turn_specs[0].name);
     try std.testing.expect(agent.priorityToolForSpecsMessage(turn_specs, "private") == null);
     agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+// ── filterToolsForPromptText tests ─────────────────────────────────
+
+const MockFilterTool = struct {
+    name_buf: []const u8,
+    desc_buf: []const u8,
+};
+
+fn mockFilterToolVTable() tools_mod.Tool.VTable {
+    return .{
+        .name = struct {
+            fn f(ptr: *anyopaque) []const u8 {
+                return @as(*const MockFilterTool, @ptrCast(@alignCast(ptr))).name_buf;
+            }
+        }.f,
+        .description = struct {
+            fn f(ptr: *anyopaque) []const u8 {
+                return @as(*const MockFilterTool, @ptrCast(@alignCast(ptr))).desc_buf;
+            }
+        }.f,
+        .parameters_json = struct {
+            fn f(_: *anyopaque) []const u8 {
+                return "{}";
+            }
+        }.f,
+        .execute = struct {
+            fn f(_: *anyopaque, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) anyerror!tools_mod.ToolResult {
+                return tools_mod.ToolResult.ok("");
+            }
+        }.f,
+    };
+}
+
+fn makeMockFilterTool(allocator: std.mem.Allocator, name: []const u8) !Tool {
+    const m = try allocator.create(MockFilterTool);
+    m.* = .{ .name_buf = try allocator.dupe(u8, name), .desc_buf = try allocator.dupe(u8, name) };
+    const vt = try allocator.create(tools_mod.Tool.VTable);
+    vt.* = mockFilterToolVTable();
+    return .{ .ptr = @ptrCast(m), .vtable = vt };
+}
+
+fn freeMockFilterTool(tool: Tool, allocator: std.mem.Allocator) void {
+    const m: *MockFilterTool = @ptrCast(@alignCast(tool.ptr));
+    allocator.free(m.name_buf);
+    allocator.free(m.desc_buf);
+    allocator.destroy(m);
+    allocator.destroy(@constCast(tool.vtable));
+}
+
+test "filterToolsForPromptText no groups returns all tools" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tools);
+
+    agent.tools = &.{
+        try makeMockFilterTool(allocator, "shell"),
+        try makeMockFilterTool(allocator, "mcp_webdav_read"),
+    };
+    defer for (agent.tools) |t| freeMockFilterTool(t, allocator);
+
+    const result = try agent.filterToolsForPromptText(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+}
+
+test "filterToolsForPromptText always group includes matching MCP" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tools);
+
+    agent.tools = &.{
+        try makeMockFilterTool(allocator, "shell"),
+        try makeMockFilterTool(allocator, "mcp_webdav_read"),
+        try makeMockFilterTool(allocator, "mcp_browser_open"),
+    };
+    defer for (agent.tools) |t| freeMockFilterTool(t, allocator);
+    agent.tool_filter_groups = &.{
+        .{ .mode = .always, .tools = &.{"mcp_webdav_*"} },
+    };
+
+    const result = try agent.filterToolsForPromptText(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+}
+
+test "filterToolsForPromptText dynamic group excluded from text" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tools);
+
+    agent.tools = &.{
+        try makeMockFilterTool(allocator, "shell"),
+        try makeMockFilterTool(allocator, "mcp_vikunja_create_task"),
+        try makeMockFilterTool(allocator, "mcp_webdav_read"),
+    };
+    defer for (agent.tools) |t| freeMockFilterTool(t, allocator);
+    agent.tool_filter_groups = &.{
+        .{ .mode = .dynamic, .tools = &.{"mcp_vikunja_*"}, .keywords = &.{"task"} },
+        .{ .mode = .always, .tools = &.{"mcp_webdav_*"} },
+    };
+
+    const result = try agent.filterToolsForPromptText(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("shell", result[0].name());
+}
+
+test "filterToolsForPromptText empty filter groups returns all tools" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tools);
+
+    agent.tools = &.{
+        try makeMockFilterTool(allocator, "shell"),
+        try makeMockFilterTool(allocator, "mcp_webdav_read"),
+    };
+    defer for (agent.tools) |t| freeMockFilterTool(t, allocator);
+
+    const result = try agent.filterToolsForPromptText(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), result.len);
 }
 
 test "buildProviderMessagesForTurn adds priority hint without mutating history" {
