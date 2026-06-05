@@ -69,6 +69,7 @@ const known_url_model_provider_namespaces = std.StaticStringMap(void).initCompti
     .{ "venice", {} },
     .{ "nearai", {} },
     .{ "atlas-cloud", {} },
+    .{ "evolink", {} },
     .{ "vercel-ai", {} },
     .{ "poe", {} },
     .{ "xiaomi", {} },

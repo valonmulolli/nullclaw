@@ -324,6 +324,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "venice", .{ "VENICE_API_KEY", "", "" } },
         .{ "nearai", .{ "NEARAI_API_KEY", "NEARAI_CLOUD_API_KEY", "NEAR_AI_API_KEY" } },
         .{ "atlas-cloud", .{ "ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY", "ATLAS_API_KEY" } },
+        .{ "evolink", .{ "EVOLINK_API_KEY", "", "" } },
         .{ "poe", .{ "POE_API_KEY", "", "" } },
         .{ "moonshot", .{ "MOONSHOT_API_KEY", "", "" } },
         .{ "kimi", .{ "MOONSHOT_API_KEY", "", "" } },

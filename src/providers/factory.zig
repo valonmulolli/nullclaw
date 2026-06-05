@@ -85,6 +85,7 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "venice", .url = "https://api.venice.ai", .display = "Venice" },
     .{ .name = "nearai", .url = "https://cloud-api.near.ai/v1", .display = "NEAR AI Cloud" },
     .{ .name = "atlas-cloud", .url = "https://api.atlascloud.ai/v1", .display = "Atlas Cloud" },
+    .{ .name = "evolink", .url = "https://direct.evolink.ai/v1", .display = "Evolink" },
     .{ .name = "vercel", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "vercel-ai", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "together", .url = "https://api.together.xyz", .display = "Together AI" },
@@ -723,6 +724,12 @@ test "lm-studio resolves to localhost:1234" {
 
 test "astrai resolves to astrai API URL" {
     try std.testing.expectEqualStrings("https://as-trai.com/v1", compatibleProviderUrl("astrai").?);
+}
+
+test "evolink resolves to direct.evolink.ai compatible provider" {
+    try std.testing.expect(classifyProvider("evolink") == .compatible_provider);
+    try std.testing.expectEqualStrings("https://direct.evolink.ai/v1", compatibleProviderUrl("evolink").?);
+    try std.testing.expectEqualStrings("Evolink", compatibleProviderDisplayName("evolink"));
 }
 
 test "anthropic-custom prefix classifies as anthropic provider" {
