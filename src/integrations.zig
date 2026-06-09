@@ -239,6 +239,14 @@ test "findIntegration finds Telegram" {
     try std.testing.expectEqual(IntegrationCategory.chat, entry.?.category);
 }
 
+test "findIntegration finds Evolink" {
+    const entry = findIntegration("Evolink");
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqualStrings("Evolink", entry.?.name);
+    try std.testing.expectEqual(IntegrationCategory.ai_model, entry.?.category);
+    try std.testing.expectEqual(IntegrationStatus.available, entry.?.status);
+}
+
 test "findIntegration is case-insensitive" {
     const entry = findIntegration("telegram");
     try std.testing.expect(entry != null);

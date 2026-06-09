@@ -592,6 +592,7 @@ test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("atlas-cloud") == .compatible_provider);
     try std.testing.expect(classifyProvider("atlas") == .compatible_provider);
     try std.testing.expect(classifyProvider("atlascloud") == .compatible_provider);
+    try std.testing.expect(classifyProvider("evolink") == .compatible_provider);
     try std.testing.expect(classifyProvider("poe") == .compatible_provider);
     try std.testing.expect(classifyProvider("custom:https://example.com") == .compatible_provider);
     try std.testing.expect(classifyProvider("openai-codex") == .openai_codex_provider);
@@ -636,6 +637,7 @@ test "compatibleProviderUrl returns correct URLs" {
     try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlas-cloud").?);
     try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlas").?);
     try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlascloud").?);
+    try std.testing.expectEqualStrings("https://direct.evolink.ai/v1", compatibleProviderUrl("evolink").?);
     try std.testing.expectEqualStrings("https://api.groq.com/openai/v1", compatibleProviderUrl("groq").?);
     try std.testing.expectEqualStrings("https://api.deepseek.com", compatibleProviderUrl("deepseek").?);
     try std.testing.expectEqualStrings("https://api.poe.com/v1", compatibleProviderUrl("poe").?);
@@ -726,12 +728,6 @@ test "astrai resolves to astrai API URL" {
     try std.testing.expectEqualStrings("https://as-trai.com/v1", compatibleProviderUrl("astrai").?);
 }
 
-test "evolink resolves to direct.evolink.ai compatible provider" {
-    try std.testing.expect(classifyProvider("evolink") == .compatible_provider);
-    try std.testing.expectEqualStrings("https://direct.evolink.ai/v1", compatibleProviderUrl("evolink").?);
-    try std.testing.expectEqualStrings("Evolink", compatibleProviderDisplayName("evolink"));
-}
-
 test "anthropic-custom prefix classifies as anthropic provider" {
     try std.testing.expect(classifyProvider("anthropic-custom:https://my-api.example.com") == .anthropic_provider);
 }
@@ -757,6 +753,7 @@ test "new providers display names" {
     try std.testing.expectEqualStrings("Atlas Cloud", compatibleProviderDisplayName("atlas-cloud"));
     try std.testing.expectEqualStrings("Atlas Cloud", compatibleProviderDisplayName("atlas"));
     try std.testing.expectEqualStrings("Atlas Cloud", compatibleProviderDisplayName("atlascloud"));
+    try std.testing.expectEqualStrings("Evolink", compatibleProviderDisplayName("evolink"));
     try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("xiaomi"));
     try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("xiaomi-mimo"));
     try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("mimo"));
@@ -840,6 +837,11 @@ test "findCompatProvider returns correct flags" {
     const atlas = findCompatProvider("atlas").?;
     try std.testing.expect(!atlas.no_responses_fallback);
     try std.testing.expect(atlas.auth_style == .bearer);
+
+    // Evolink is an OpenAI-compatible Bearer-token provider.
+    const evolink = findCompatProvider("evolink").?;
+    try std.testing.expect(!evolink.no_responses_fallback);
+    try std.testing.expect(evolink.auth_style == .bearer);
 
     // minimax-cn also has both flags
     const minimax_cn = findCompatProvider("minimax-cn").?;
@@ -964,6 +966,16 @@ test "fromConfig configures Atlas Cloud compatible provider" {
     try std.testing.expect(h == .compatible);
     try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", h.compatible.base_url);
     try std.testing.expectEqualStrings("atlas-cloud", h.compatible.name);
+    try std.testing.expect(h.compatible.supports_responses_fallback);
+}
+
+test "fromConfig configures Evolink compatible provider" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "evolink", "key", null, true, null, null, false, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqualStrings("https://direct.evolink.ai/v1", h.compatible.base_url);
+    try std.testing.expectEqualStrings("evolink", h.compatible.name);
     try std.testing.expect(h.compatible.supports_responses_fallback);
 }
 

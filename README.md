@@ -379,6 +379,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
       "openrouter": { "api_key": "sk-or-..." },
       "nearai": { "api_key": "YOUR_NEARAI_API_KEY" },
       "atlas-cloud": { "api_key": "YOUR_ATLASCLOUD_API_KEY" },
+      "evolink": { "api_key": "YOUR_EVOLINK_API_KEY" },
       "groq": { "api_key": "gsk_..." },
       "vertex": {
         "api_key": {

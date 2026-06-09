@@ -423,6 +423,11 @@ test "atlas cloud env candidates include documented ATLASCLOUD_API_KEY" {
     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvCandidates("atlascloud")[0]);
 }
 
+test "evolink env candidate is EVOLINK_API_KEY" {
+    const candidates = providerEnvCandidates("evolink");
+    try std.testing.expectEqualStrings("EVOLINK_API_KEY", candidates[0]);
+}
+
 test "azure aliases share Azure env candidate" {
     try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure")[0]);
     try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure-openai")[0]);
