@@ -566,7 +566,7 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
 
     // Tests must stay deterministic and offline; production can consult the
     // public models.dev catalog as a secondary source.
-    if (!builtin.is_test and shouldUseModelsDevCatalog(canonical, api_key)) {
+    if (!builtin.is_test and shouldUseModelsDevCatalog(canonical, api_key, base_url)) {
         if (fetchModelsFromModelsDev(allocator, canonical)) |maybe_models| {
             if (maybe_models) |models| return models;
         } else |err| {
@@ -608,6 +608,16 @@ fn resolveNativeModelsRequest(
     canonical: []const u8,
     base_url: ?[]const u8,
 ) !?NativeModelsRequest {
+    if (base_url) |configured| {
+        // Config base_url overrides built-in URL tables, matching provider
+        // factory behavior for OpenAI-compatible providers.
+        return .{
+            .url = try buildModelsUrl(allocator, configured),
+            .url_owned = true,
+            .needs_auth = false,
+            .auth_optional = true,
+        };
+    }
     if (staticNativeModelCatalogForProvider(canonical)) |catalog| {
         return .{
             .url = catalog.url,
@@ -617,25 +627,23 @@ fn resolveNativeModelsRequest(
             .parse_options = catalog.parse_options,
         };
     }
+    if (std.mem.startsWith(u8, canonical, "custom:")) {
+        const custom_url = canonical["custom:".len..];
+        if (std.mem.startsWith(u8, custom_url, "http://") or std.mem.startsWith(u8, custom_url, "https://")) {
+            return .{
+                .url = try buildModelsUrl(allocator, custom_url),
+                .url_owned = true,
+                .needs_auth = false,
+                .auth_optional = true,
+            };
+        }
+    }
     if (std.mem.startsWith(u8, canonical, "http://") or std.mem.startsWith(u8, canonical, "https://")) {
         return .{
             .url = try buildModelsUrl(allocator, canonical),
             .url_owned = true,
             .needs_auth = true,
             .auth_optional = false,
-        };
-    }
-    if (base_url) |configured| {
-        // Custom OpenAI-compatible provider with an arbitrary name and a
-        // `base_url` in config. Query <base_url>/models like any other
-        // OpenAI-style endpoint. Auth is optional: local routers
-        // (LM Studio, llama.cpp, vLLM) commonly serve models without a key,
-        // but we still attach one when configured.
-        return .{
-            .url = try buildModelsUrl(allocator, configured),
-            .url_owned = true,
-            .needs_auth = false,
-            .auth_optional = true,
         };
     }
     return null;
@@ -698,7 +706,8 @@ fn modelsDevProviderKey(provider: []const u8) ?[]const u8 {
     return null;
 }
 
-fn shouldUseModelsDevCatalog(provider: []const u8, api_key: ?[]const u8) bool {
+fn shouldUseModelsDevCatalog(provider: []const u8, api_key: ?[]const u8, base_url: ?[]const u8) bool {
+    if (base_url != null) return false;
     if (modelsDevProviderKey(provider) == null) return false;
     if (std.mem.eql(u8, provider, "openai") or std.mem.eql(u8, provider, "groq")) {
         return api_key == null;
@@ -706,8 +715,12 @@ fn shouldUseModelsDevCatalog(provider: []const u8, api_key: ?[]const u8) bool {
     return true;
 }
 
-fn modelsCacheProviderKey(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8) ![]const u8 {
-    if (!shouldUseModelsDevCatalog(provider, api_key)) {
+fn modelsCacheProviderKey(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8, base_url: ?[]const u8) ![]const u8 {
+    if (base_url) |configured| {
+        const endpoint_hash = std.hash.Wyhash.hash(0, configured);
+        return try std.fmt.allocPrint(allocator, "{s}@base-url:{x}", .{ provider, endpoint_hash });
+    }
+    if (!shouldUseModelsDevCatalog(provider, api_key, null)) {
         return try allocator.dupe(u8, provider);
     }
     return try std.fmt.allocPrint(allocator, "{s}@models.dev", .{provider});
@@ -971,7 +984,7 @@ fn loadModelsWithCacheInner(allocator: std.mem.Allocator, cache_dir: []const u8,
     const canonical = canonicalProviderName(provider);
     const cache_path = try std.fmt.allocPrint(allocator, "{s}/models_cache.json", .{cache_dir});
     defer allocator.free(cache_path);
-    const cache_provider = try modelsCacheProviderKey(allocator, canonical, api_key);
+    const cache_provider = try modelsCacheProviderKey(allocator, canonical, api_key, base_url);
     defer allocator.free(cache_provider);
 
     // Try reading cache file
@@ -1044,15 +1057,13 @@ fn saveCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
     var ts_buf: [24]u8 = undefined;
     const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std_compat.time.timestamp()}) catch return;
     try buf.appendSlice(allocator, ts_str);
-    try buf.appendSlice(allocator, ",\n  \"");
-    try buf.appendSlice(allocator, provider);
-    try buf.appendSlice(allocator, "\": [");
+    try buf.appendSlice(allocator, ",\n  ");
+    try json_util.appendJsonString(&buf, allocator, provider);
+    try buf.appendSlice(allocator, ": [");
 
     for (models, 0..) |m, i| {
         if (i > 0) try buf.appendSlice(allocator, ", ");
-        try buf.append(allocator, '"');
-        try buf.appendSlice(allocator, m);
-        try buf.append(allocator, '"');
+        try json_util.appendJsonString(&buf, allocator, m);
     }
 
     try buf.appendSlice(allocator, "]\n}\n");
@@ -5091,17 +5102,55 @@ test "cache read returns error for expired cache" {
 }
 
 test "modelsCacheProviderKey keeps public catalog separate from native listings" {
-    const public_key = try modelsCacheProviderKey(std.testing.allocator, "openai", null);
+    const public_key = try modelsCacheProviderKey(std.testing.allocator, "openai", null, null);
     defer std.testing.allocator.free(public_key);
     try std.testing.expectEqualStrings("openai@models.dev", public_key);
 
-    const native_key = try modelsCacheProviderKey(std.testing.allocator, "openai", "test-key");
+    const native_key = try modelsCacheProviderKey(std.testing.allocator, "openai", "test-key", null);
     defer std.testing.allocator.free(native_key);
     try std.testing.expectEqualStrings("openai", native_key);
 
-    const anthropic_key = try modelsCacheProviderKey(std.testing.allocator, "anthropic", null);
+    const anthropic_key = try modelsCacheProviderKey(std.testing.allocator, "anthropic", null, null);
     defer std.testing.allocator.free(anthropic_key);
     try std.testing.expectEqualStrings("anthropic@models.dev", anthropic_key);
+
+    const base_url_key = try modelsCacheProviderKey(std.testing.allocator, "my-gateway", null, "http://127.0.0.1:8080/v1");
+    defer std.testing.allocator.free(base_url_key);
+    try std.testing.expect(std.mem.startsWith(u8, base_url_key, "my-gateway@base-url:"));
+}
+
+test "modelsCacheProviderKey separates configured base_url endpoints" {
+    // Regression: custom provider names can point at different gateways over
+    // time; their cached model lists must not alias only by provider name.
+    const first = try modelsCacheProviderKey(std.testing.allocator, "my-gateway", null, "http://127.0.0.1:8080/v1");
+    defer std.testing.allocator.free(first);
+    const second = try modelsCacheProviderKey(std.testing.allocator, "my-gateway", null, "http://127.0.0.1:9090/v1");
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "cache round-trip escapes provider keys and model ids" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    defer std.testing.allocator.free(cache_path);
+
+    const models = [_][]const u8{ "model\"quote", "path\\model" };
+    try saveCachedModels(std.testing.allocator, cache_path, "provider\"quote", &models);
+
+    const loaded = try readCachedModels(std.testing.allocator, cache_path, "provider\"quote");
+    defer {
+        for (loaded) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+    try std.testing.expectEqualStrings("model\"quote", loaded[0]);
+    try std.testing.expectEqualStrings("path\\model", loaded[1]);
 }
 
 test "loadModelsWithCache keeps public and native cache entries separate" {
@@ -5218,6 +5267,30 @@ test "resolveNativeModelsRequest uses base_url for custom provider (regression #
         return error.TestExpectedEqual;
     defer if (req.url_owned) allocator.free(req.url);
     try std.testing.expectEqualStrings("http://192.168.1.100:8080/v1/models", req.url);
+    try std.testing.expect(!req.needs_auth);
+    try std.testing.expect(req.auth_optional);
+}
+
+test "resolveNativeModelsRequest lets base_url override known provider catalog (regression #936)" {
+    const allocator = std.testing.allocator;
+    // Runtime config lets OpenAI-compatible providers override their base_url;
+    // model listing must query the same endpoint instead of a built-in catalog.
+    const req = (try resolveNativeModelsRequest(allocator, "groq", "http://127.0.0.1:8080/v1")) orelse
+        return error.TestExpectedEqual;
+    defer if (req.url_owned) allocator.free(req.url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/v1/models", req.url);
+    try std.testing.expect(!req.needs_auth);
+    try std.testing.expect(req.auth_optional);
+}
+
+test "resolveNativeModelsRequest supports custom prefix without separate base_url (regression #936)" {
+    const allocator = std.testing.allocator;
+    // Interactive paths often carry an explicit providers entry with base_url,
+    // but direct custom: providers should still resolve by their embedded URL.
+    const req = (try resolveNativeModelsRequest(allocator, "custom:http://127.0.0.1:8080/v1", null)) orelse
+        return error.TestExpectedEqual;
+    defer if (req.url_owned) allocator.free(req.url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/v1/models", req.url);
     try std.testing.expect(!req.needs_auth);
     try std.testing.expect(req.auth_optional);
 }

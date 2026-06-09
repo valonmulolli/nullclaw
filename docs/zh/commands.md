@@ -186,7 +186,7 @@
 | 命令 | 说明 |
 |---|---|
 | `nullclaw --export-manifest` | 导出 manifest |
-| `nullclaw --list-models` | 列出模型信息 |
+| `nullclaw --list-models --provider <name> [--api-key <key>] [--base-url <url>]` | 列出模型信息，也支持自定义 OpenAI 兼容端点 |
 | `nullclaw --probe-provider-health` | 探测 provider 健康状态 |
 | `nullclaw --probe-channel-health` | 探测 channel 健康状态 |
 | `nullclaw --from-json` | 从 JSON 输入执行特定流程 |

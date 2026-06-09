@@ -215,7 +215,7 @@ These are more useful for automation, probing, or integrations than for normal d
 | Command | Purpose |
 |---|---|
 | `nullclaw --export-manifest` | Export the runtime manifest |
-| `nullclaw --list-models` | Print model information |
+| `nullclaw --list-models --provider <name> [--api-key <key>] [--base-url <url>]` | Print model information, including custom OpenAI-compatible endpoints |
 | `nullclaw --probe-provider-health` | Probe provider health |
 | `nullclaw --probe-channel-health` | Probe channel health |
 | `nullclaw --from-json` | Run a JSON-driven entry path |
