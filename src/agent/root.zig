@@ -29,6 +29,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const CommandRiskLevel = @import("../security/root.zig").CommandRiskLevel;
 const util = @import("../util.zig");
 const verbose_mod = @import("../verbose.zig");
 const cost_mod = @import("../cost.zig");
@@ -82,6 +83,32 @@ pub const ProgressSink = struct {
 /// Callback invoked at each tool-loop boundary to drain a pending mid-turn injection.
 /// Returns an owned slice allocated with the provided allocator, or null if empty.
 pub const DrainCallback = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8;
+
+// ── Structured approval (approval_request / approval_response) ────────────
+
+/// Prefix used by channels when converting an approval_response event into a
+/// user message. The trailing colon ensures the remainder after stripping the
+/// prefix starts with the tool_call_id, so splitScalar(':') yields the correct
+/// fields. Format: __approval_response__:<tool_call_id>:<yes|no>[:<reason>]
+pub const APPROVAL_RESPONSE_PREFIX: []const u8 = "__approval_response__:";
+
+/// Pending tool-execution approval, set when a tool raises ApprovalRequired.
+/// Stored across turns; resolved when the user sends an approval_response message.
+pub const PendingApproval = struct {
+    tool_name: []const u8,
+    tool_call_id: ?[]const u8,
+    command: []const u8,
+    risk_level: CommandRiskLevel,
+    args_json: []const u8,
+    timestamp: i64,
+
+    pub fn deinit(self: *PendingApproval, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_name);
+        if (self.tool_call_id) |id| allocator.free(id);
+        allocator.free(self.command);
+        allocator.free(self.args_json);
+    }
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
@@ -368,6 +395,10 @@ pub const Agent = struct {
 
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
+
+    /// Pending tool-execution approval. Set when a tool raises ApprovalRequired.
+    /// Stored across turns; resolved when the user sends an approval_response message.
+    pending_approval: ?PendingApproval = null,
 
     /// Optional streaming callback. When set, turn() uses streamChat() for streaming providers.
     stream_callback: ?providers.StreamCallback = null,
@@ -684,6 +715,7 @@ pub const Agent = struct {
             msg.deinit(self.allocator);
         }
         self.history.deinit(self.allocator);
+        if (self.pending_approval) |*pa| pa.deinit(self.allocator);
         for (self.detected_vision_disabled.items) |model| {
             self.allocator.free(model);
         }
@@ -746,6 +778,113 @@ pub const Agent = struct {
         self.interrupted_tools.clearRetainingCapacity();
 
         return try out.toOwnedSlice(self.allocator);
+    }
+
+    /// Send a structured approval_request event to the channel via the stream callback.
+    fn sendApprovalRequestEvent(
+        self: *Agent,
+        command: []const u8,
+        risk_level: CommandRiskLevel,
+        tool_call_id: ?[]const u8,
+    ) void {
+        const stream_cb = self.stream_callback orelse {
+            log.warn("approval request skipped: no stream callback (channel does not support interactive approval UI)", .{});
+            return;
+        };
+        const stream_ctx = self.stream_ctx orelse {
+            log.warn("approval request skipped: no stream context", .{});
+            return;
+        };
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        const w = &buf_writer.writer;
+
+        w.print("---approval---\ncommand: {s}\nrisk_level: {s}\ntool_call_id: {s}\n---end---", .{
+            command,
+            risk_level.toString(),
+            tool_call_id orelse "",
+        }) catch return;
+
+        stream_cb(stream_ctx, providers.StreamChunk.textDelta(buf_writer.toArrayList().items));
+    }
+
+    /// Check if user content is a structured approval response. If so, extract
+    /// the decision, resolve the pending approval, and return true. The caller
+    /// is responsible for not passing this raw content into the LLM history.
+    fn tryResolveApproval(self: *Agent, content: []const u8) bool {
+        const pending = self.pending_approval orelse return false;
+        if (!std.mem.startsWith(u8, content, APPROVAL_RESPONSE_PREFIX)) return false;
+
+        const after_prefix = content[APPROVAL_RESPONSE_PREFIX.len..];
+        var parts = std.mem.splitScalar(u8, after_prefix, ':');
+
+        const tool_call_id_match = parts.next() orelse "";
+        const decision_part = parts.next() orelse "";
+
+        if (pending.tool_call_id) |id| {
+            if (!std.mem.eql(u8, id, tool_call_id_match)) return false;
+        }
+
+        if (std.mem.eql(u8, decision_part, "yes") or std.mem.eql(u8, decision_part, "y")) {
+            self.runApprovedTool(pending) catch |err| {
+                log.warn("runApprovedTool failed: {}", .{err});
+            };
+        }
+
+        var owned = pending;
+        self.pending_approval = null;
+        owned.deinit(self.allocator);
+        return true;
+    }
+
+    /// Re-execute the tool from pending_approval with the approved flag set.
+    fn runApprovedTool(self: *Agent, pending: PendingApproval) !void {
+        for (self.tools) |t| {
+            if (!std.mem.eql(u8, t.name(), pending.tool_name)) continue;
+
+            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, pending.args_json, .{}) catch |err| {
+                log.warn("failed to parse pending approval args: {}", .{err});
+                return;
+            };
+            defer parsed.deinit();
+
+            const args: std.json.ObjectMap = switch (parsed.value) {
+                .object => |o| o,
+                else => return,
+            };
+
+            const prev_approved = tools_mod.setThreadApproved(true);
+            defer _ = tools_mod.setThreadApproved(prev_approved);
+            const tool_result = t.execute(self.allocator, args) catch |err| {
+                log.warn("re-execution of approved tool '{s}' failed: {s}", .{ pending.tool_name, @errorName(err) });
+                const msg = std.fmt.allocPrint(
+                    self.allocator,
+                    "[Approved tool re-execution failed: {s}]",
+                    .{@errorName(err)},
+                ) catch return;
+                self.appendOwnedHistoryMessage(.{ .role = .user, .content = msg }) catch {};
+                return;
+            };
+
+            var result_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer result_arena.deinit();
+            const result_text = if (tool_result.success)
+                try result_arena.allocator().dupe(u8, tool_result.output)
+            else
+                try result_arena.allocator().dupe(u8, tool_result.error_msg orelse tool_result.output);
+
+            // appendOwnedHistoryMessage takes ownership of msg; no defer free.
+            const msg = try std.fmt.allocPrint(
+                self.allocator,
+                "[Approved: tool '{s}' completed: {s}]",
+                .{ pending.tool_name, result_text },
+            );
+            self.appendOwnedHistoryMessage(.{ .role = .user, .content = msg }) catch {};
+            return;
+        }
+        log.warn("tool '{s}' not found for approval re-execution", .{pending.tool_name});
     }
 
     pub fn snapshotActiveToolName(self: *Agent, allocator: std.mem.Allocator) !?[]u8 {
@@ -2122,16 +2261,30 @@ pub const Agent = struct {
             }
         }
 
-        // Enrich message with memory context (always returns owned slice; ownership → history)
-        // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
-        const enriched_raw = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, safe_user_message, self.memory_session_id)
-        else
-            try self.allocator.dupe(u8, safe_user_message);
-        const enriched = try self.redactOwnedForHistory(enriched_raw);
+        // Check for structured approval response from channel UI.
+        // Approval responses are resolved inline and inject a continuation
+        // cue into history; they MUST NOT be enriched with memory context.
+        if (self.tryResolveApproval(effective_user_message)) {
+            const follow_up = try self.allocator.dupe(u8, "[Approval processed. Continue.]");
+            const follow_up_redacted = try self.redactOwnedForHistory(follow_up);
+            try self.appendOwnedHistoryMessage(.{ .role = .user, .content = follow_up_redacted });
+        } else if (std.mem.startsWith(u8, effective_user_message, APPROVAL_RESPONSE_PREFIX)) {
+            // Unmatched structured approval response — no pending approval or
+            // tool_call_id mismatch. Discard the raw protocol text; inject a
+            // neutral continuation so the turn loop can proceed.
+            const follow_up = try self.allocator.dupe(u8, "[Approval response discarded — no pending approval.]");
+            const follow_up_redacted = try self.redactOwnedForHistory(follow_up);
+            try self.appendOwnedHistoryMessage(.{ .role = .user, .content = follow_up_redacted });
+        } else {
+            // Normal user message: enrich with memory context and append to history.
+            const enriched_raw = if (self.mem) |mem|
+                try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, safe_user_message, self.memory_session_id)
+            else
+                try self.allocator.dupe(u8, safe_user_message);
+            const enriched = try self.redactOwnedForHistory(enriched_raw);
 
-        // Keep the user message retained even if provider/tool steps fail.
-        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
+            try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
+        }
 
         var sys_bytes: usize = 0;
         var hist_bytes: usize = 0;
@@ -3173,6 +3326,52 @@ pub const Agent = struct {
                 const previous_memory_session_id = tools_mod.setThreadMemorySessionId(self.memory_session_id);
                 defer _ = tools_mod.setThreadMemorySessionId(previous_memory_session_id);
                 const result = t.execute(tool_allocator, args) catch |err| {
+                    if (err == error.ApprovalRequired) {
+                        const command = tools_mod.getString(args, "command") orelse "unknown";
+                        const risk_level: CommandRiskLevel = blk: {
+                            if (self.policy) |pol| break :blk pol.commandRiskLevel(command);
+                            break :blk .medium;
+                        };
+                        const owned_name = self.allocator.dupe(u8, call.name) catch {
+                            return .{ .name = call.name, .output = "OutOfMemory", .success = false, .tool_call_id = call.tool_call_id };
+                        };
+                        const owned_id = if (call.tool_call_id) |id|
+                            self.allocator.dupe(u8, id) catch null
+                        else
+                            null;
+                        const owned_cmd = self.allocator.dupe(u8, command) catch {
+                            self.allocator.free(owned_name);
+                            return .{ .name = call.name, .output = "OutOfMemory", .success = false, .tool_call_id = call.tool_call_id };
+                        };
+                        const owned_args = self.allocator.dupe(u8, call.arguments_json) catch {
+                            self.allocator.free(owned_name);
+                            self.allocator.free(owned_cmd);
+                            if (owned_id) |id| self.allocator.free(id);
+                            return .{ .name = call.name, .output = "OutOfMemory", .success = false, .tool_call_id = call.tool_call_id };
+                        };
+                        self.pending_approval = .{
+                            .tool_name = owned_name,
+                            .tool_call_id = owned_id,
+                            .command = owned_cmd,
+                            .risk_level = risk_level,
+                            .args_json = owned_args,
+                            .timestamp = std_compat.time.timestamp(),
+                        };
+                        self.sendApprovalRequestEvent(owned_cmd, risk_level, call.tool_call_id);
+                        const pending_output = std.fmt.allocPrint(
+                            tool_allocator,
+                            "[Approval pending for command: {s} (risk: {s})]",
+                            .{ command, risk_level.toString() },
+                        ) catch |oom_err| {
+                            return .{ .name = call.name, .output = @errorName(oom_err), .success = false, .tool_call_id = call.tool_call_id };
+                        };
+                        return .{
+                            .name = call.name,
+                            .output = pending_output,
+                            .success = false,
+                            .tool_call_id = call.tool_call_id,
+                        };
+                    }
                     if (verbose_mod.isVerbose()) {
                         log.info("tool result: name={s} error={s}", .{ call.name, @errorName(err) });
                     }
@@ -12185,4 +12384,194 @@ test "Agent: redactor scrubs PII in system prompt" {
     // System prompt content must reach provider with email redacted.
     try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+}
+
+// ── Approval flow tests ───────────────────────────────────────────────────
+
+test "ApprovalResponsePrefix matches web channel format" {
+    try std.testing.expect(std.mem.startsWith(u8, APPROVAL_RESPONSE_PREFIX, "__"));
+    try std.testing.expect(std.mem.endsWith(u8, APPROVAL_RESPONSE_PREFIX, ":"));
+    const example = "__approval_response__:call_1:yes";
+    const after = example[APPROVAL_RESPONSE_PREFIX.len..];
+    var parts = std.mem.splitScalar(u8, after, ':');
+    try std.testing.expectEqualStrings("call_1", parts.next().?);
+    try std.testing.expectEqualStrings("yes", parts.next().?);
+    try std.testing.expect(parts.next() == null);
+}
+
+test "PendingApproval deinit with null tool_call_id does not leak" {
+    const allocator = std.testing.allocator;
+    var pa = PendingApproval{
+        .tool_name = try allocator.dupe(u8, "test-tool"),
+        .tool_call_id = null,
+        .command = try allocator.dupe(u8, "echo hello"),
+        .risk_level = .medium,
+        .args_json = try allocator.dupe(u8, "{}"),
+        .timestamp = 0,
+    };
+    defer pa.deinit(allocator);
+}
+
+test "PendingApproval deinit with tool_call_id does not leak" {
+    const allocator = std.testing.allocator;
+    var pa = PendingApproval{
+        .tool_name = try allocator.dupe(u8, "test-tool"),
+        .tool_call_id = try allocator.dupe(u8, "call_123"),
+        .command = try allocator.dupe(u8, "echo hello"),
+        .risk_level = .high,
+        .args_json = try allocator.dupe(u8, "{\"command\":\"echo hello\"}"),
+        .timestamp = 1000,
+    };
+    defer pa.deinit(allocator);
+}
+
+test "tryResolveApproval returns false when no pending approval" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/test",
+        .config_path = "/tmp/test/config.json",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = cfg.default_model orelse "test",
+        .temperature = 0.7,
+        .workspace_dir = cfg.workspace_dir,
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    try std.testing.expect(!agent.tryResolveApproval("__approval_response__:call_1:yes"));
+    try std.testing.expect(agent.pending_approval == null);
+}
+
+test "tryResolveApproval returns false on mismatched tool_call_id" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/test",
+        .config_path = "/tmp/test/config.json",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = cfg.default_model orelse "test",
+        .temperature = 0.7,
+        .workspace_dir = cfg.workspace_dir,
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    agent.pending_approval = PendingApproval{
+        .tool_name = try allocator.dupe(u8, "shell"),
+        .tool_call_id = try allocator.dupe(u8, "call_1"),
+        .command = try allocator.dupe(u8, "ls"),
+        .risk_level = .medium,
+        .args_json = try allocator.dupe(u8, "{\"command\":\"ls\"}"),
+        .timestamp = 1000,
+    };
+
+    try std.testing.expect(!agent.tryResolveApproval("__approval_response__:call_2:yes"));
+    try std.testing.expect(agent.pending_approval != null);
+}
+
+test "tryResolveApproval resolves with matching prefix and clears pending" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/test",
+        .config_path = "/tmp/test/config.json",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = cfg.default_model orelse "test",
+        .temperature = 0.7,
+        .workspace_dir = cfg.workspace_dir,
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    agent.pending_approval = PendingApproval{
+        .tool_name = try allocator.dupe(u8, "shell"),
+        .tool_call_id = try allocator.dupe(u8, "call_1"),
+        .command = try allocator.dupe(u8, "ls"),
+        .risk_level = .medium,
+        .args_json = try allocator.dupe(u8, "{\"command\":\"ls\"}"),
+        .timestamp = 1000,
+    };
+
+    try std.testing.expect(agent.tryResolveApproval("__approval_response__:call_1:yes"));
+    try std.testing.expect(agent.pending_approval == null);
+}
+
+test "tryResolveApproval does not match non-prefixed messages" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/test",
+        .config_path = "/tmp/test/config.json",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = cfg.default_model orelse "test",
+        .temperature = 0.7,
+        .workspace_dir = cfg.workspace_dir,
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    agent.pending_approval = PendingApproval{
+        .tool_name = try allocator.dupe(u8, "shell"),
+        .tool_call_id = null,
+        .command = try allocator.dupe(u8, "echo hi"),
+        .risk_level = .low,
+        .args_json = try allocator.dupe(u8, "{\"command\":\"echo hi\"}"),
+        .timestamp = 1000,
+    };
+
+    try std.testing.expect(!agent.tryResolveApproval("run the command"));
+    try std.testing.expect(agent.pending_approval != null);
 }

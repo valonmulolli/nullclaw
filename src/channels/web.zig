@@ -1451,6 +1451,41 @@ pub const WebChannel = struct {
             return;
         }
 
+        if (std.mem.eql(u8, event_type, "approval_response")) {
+            // Structured approval response from the UI. Convert to a well-known
+            // text format that the agent's tryResolveApproval will recognize.
+            const approved = blk: {
+                if (payload_obj) |p| {
+                    if (p.get("approved")) |val| {
+                        if (val == .bool) break :blk val.bool;
+                        if (val == .string) break :blk std.mem.eql(u8, val.string, "true") or std.mem.eql(u8, val.string, "yes");
+                    }
+                }
+                break :blk false;
+            };
+            const tool_call_id = payloadStringField(payload_obj, "tool_call_id") orelse "";
+            const reason = payloadStringField(payload_obj, "reason") orelse "";
+            const decision = if (approved) "yes" else "no";
+
+            var approval_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer approval_buf.deinit(self.allocator);
+            var approval_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &approval_buf);
+            const aw = &approval_writer.writer;
+            aw.print("__approval_response__:{s}:{s}", .{ tool_call_id, decision }) catch {
+                self.sendRelayError(session_id, request_id, "internal_error", "failed to build approval response");
+                return;
+            };
+            if (reason.len > 0) {
+                aw.print(":{s}", .{reason}) catch {};
+            }
+            approval_buf = approval_writer.toArrayList();
+
+            const plain_content = approval_buf.items;
+            const plain_sender = payloadStringField(payload_obj, "sender_id") orelse eventStringField(obj, "sender_id") orelse "web-user";
+            self.publishInboundMessage(plain_sender, session_id, plain_content, request_id);
+            return;
+        }
+
         if (!std.mem.eql(u8, event_type, "user_message")) return;
 
         const access_token = payloadStringField(payload_obj, "access_token") orelse eventStringField(obj, "access_token");

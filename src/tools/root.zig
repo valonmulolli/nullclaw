@@ -86,6 +86,22 @@ pub fn threadMemorySessionId() ?[]const u8 {
     return tls_memory_session_id;
 }
 
+/// Thread-local flag set by the agent when re-executing a tool after the user
+/// grants approval via the structured approval UI. ShellTool reads this flag
+/// and passes `true` to the security policy's `approved` parameter, bypassing
+/// the approval gate on re-execution.
+threadlocal var tls_approved: bool = false;
+
+pub fn setThreadApproved(approved: bool) bool {
+    const previous = tls_approved;
+    tls_approved = approved;
+    return previous;
+}
+
+pub fn threadApproved() bool {
+    return tls_approved;
+}
+
 // Sub-modules
 pub const shell = @import("shell.zig");
 pub const file_read = @import("file_read.zig");
@@ -1498,6 +1514,23 @@ test "all tools wires anonymize_text and end-to-end redacts an email" {
         break;
     }
     try std.testing.expect(saw_anonymize);
+}
+
+test "setThreadApproved and threadApproved cycle" {
+    const prev = setThreadApproved(true);
+    try std.testing.expect(prev == false);
+    try std.testing.expect(threadApproved() == true);
+
+    const prev2 = setThreadApproved(false);
+    try std.testing.expect(prev2 == true);
+    try std.testing.expect(threadApproved() == false);
+}
+
+test "setThreadApproved returns previous value on double-set" {
+    _ = setThreadApproved(true);
+    const prev = setThreadApproved(false);
+    try std.testing.expect(prev == true);
+    _ = setThreadApproved(false);
 }
 
 test {
